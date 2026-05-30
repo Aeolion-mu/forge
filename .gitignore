@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+
+# secrets & local config (NEVER commit)
+.env
+.env.*
+!.env.example
+forge.config.json
+*.pem
+*.key
+
+# runtime state / artifacts
+.forge/
+.scratch/
+*.log
+
+# local test fixtures
+test_project/
