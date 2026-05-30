@@ -26,22 +26,30 @@ The payoff is visible the moment you swap models. A top harness on its target mo
 
 **SWE-bench Verified** is the field's standard benchmark for autonomously fixing real GitHub issues: an agent gets a repo + an issue, must produce a patch, and the task counts as *resolved* only if the repository's own `FAIL_TO_PASS` + `PASS_TO_PASS` test suites pass under the official grader.
 
-Same 50 tasks, same model (`deepseek-v4-pro`), same official `run_evaluation` grader for every harness.
+Same 50 tasks, same model (`deepseek-v4-pro`), same official `run_evaluation` grader for every harness — and **controlled for reasoning effort** (see below).
 
-| Harness | Batch 1 | Batch 2 | Batches 3–5 | **Resolved / 50** | **Rate** | Empty patches |
-|---|---|---|---|---|---|---|
-| **🔥 Forge (this repo)** | 7/10 | 7/10 | 25/30 | **39 / 50** | **78%** | **0** |
-| `mini-swe-agent` (official baseline) | 6/10 | 8/10 | 23/30 | 37 / 50 | 74% | 0 |
-| `hermes-agent` | 6/10 | 6/10 | 23/30 | 35 / 50 | 70% | 5 |
-| Claude Code | 6/10 | 6/10 | 23/30 | 35 / 50 | 70% | 3 |
+| Harness | Reasoning effort | Resolved / 50 | Rate | Empty patches |
+|---|---|---|---|---|
+| **🔥 Forge (this repo)** | **high** — matched to baselines | **39 / 50** | **78%** | **0** |
+| 🔥 Forge | max | 39 / 50 | 78% | 0 |
+| `mini-swe-agent` (official baseline) | high (default) | 37 / 50 | 74% | 0 |
+| `hermes-agent` | high (default) | 35 / 50 | 70% | 5 |
+| Claude Code | max (auto, see below) | 35 / 50 | 70% | 3 |
 
-**Ranking: Forge 39 > mini 37 > hermes = Claude Code 35.**
+**Ranking at matched `high` effort: Forge 39 > mini 37 > hermes 35.**
 
-A few things worth noting:
+#### Controlling for reasoning effort (why this is a fair fight)
 
-- **Sanity check.** DeepSeek V4 Pro's official self-reported score on the *full* 500-task set is **80.6%**. Forge's **78%** on this 50-task subset lands right next to it — strong evidence the whole pipeline (images / adapters / grading) is unbiased and that Forge extracts essentially the model's full coding capability.
-- **Forge produced a patch on every task (0 empty).** The self-review pass tightens diffs without suppressing output; other harnesses occasionally fail to coax a usable diff out of the model.
-- **"A top harness is model-relative."** Claude Code is an excellent harness — on a *non-target* model (DeepSeek) it lands at 70%, not automatically ahead. Forge's explicit discipline transfers better.
+DeepSeek V4 Pro enables thinking by default. Per DeepSeek's docs, ordinary requests default to `reasoning_effort=high`, while requests it recognizes as **Claude Code / OpenCode are auto-promoted to `max`**. Out of the box that meant Forge and Claude Code ran at `max`, while mini/hermes ran at `high`. To remove the confound, **Forge was re-run at `high` (matching the baselines) — and scored the same 39/50.** Takeaways:
+
+- **Forge's result is not a thinking-budget artifact** — dropping `max`→`high` cost it zero tasks.
+- **At equal `high` effort: Forge 39 > mini 37 > hermes 35.**
+- **Claude Code at `max` (35) scored *below* mini at `high` (37)** — more thinking didn't help; harness quality is the dominant factor. (Claude Code is tuned for Claude models, not DeepSeek — "a top harness is model-relative.")
+
+A couple more notes:
+
+- **Sanity check.** DeepSeek V4 Pro's official full-500 score is **80.6%**; Forge's **78%** on this subset lands right beside it — evidence the pipeline (images / adapters / grading) is unbiased and that Forge extracts ~the model's full coding capability.
+- **Forge produced a patch on every task (0 empty)** — the self-review tightens diffs without suppressing output; other harnesses occasionally fail to coax a usable diff out of the model.
 
 ### Honest caveats (so the numbers stay defensible)
 
