@@ -20,6 +20,8 @@ Most harnesses implicitly *hope* the model behaves: stays minimal, verifies its 
 
 The payoff is visible the moment you swap models. A top harness on its target model is top *on that model*; ported to a third-party model it isn't automatically best. Forge's explicit, model-agnostic discipline is what lets it lead on DeepSeek V4 Pro — a model none of the compared harnesses were tuned for.
 
+> **Not a benchmark toy.** Forge has been dogfooded on real work — used as the coding agent to build a production **Feishu (Lark) automation bot** (OCR extraction → a tiered rule engine → LLM review). That real-world use is exactly where the *"acts before it understands"* failure mode surfaced — and motivated the discipline mechanism below.
+
 ---
 
 ## 📊 Benchmark
