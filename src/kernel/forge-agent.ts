@@ -1126,11 +1126,31 @@ export class ForgeAgent {
     this.flight?.record("user_input", { prompt: input });
     this.currentUserInstruction = input; // 供语义写守卫判断本轮意图
     this.runChangedFiles.clear();
-    await this.lane.prompt(input, undefined, this.ctx);
-    await this.lane.waitForIdle(this.ctx);
+    await this.promptLane(input);
     await this.maybeSelfReview(); // P1：本轮有写 → 强制一次 diff 自审，剔除无关改动（防过度编辑）
     await this.maybeCompact();
     await this.checkConverge(this.lastAssistantText || "(no text output)"); // 有 active 目标才会真正动作
+  }
+
+  /**
+   * lane.prompt 的统一包装：0.85 的 RunResult 把「操作失败」（如 API 401/超时）装在
+   * ok:true + status:"failed" 里而不是抛错——不检查就会静默吞掉（表象：0 token 空回复）。
+   * 这里显式抛出，交上层（TUI 队列 / one-shot）的既有错误处理链。
+   */
+  private async promptLane(input: string): Promise<void> {
+    const r = await this.lane.prompt(input, undefined, this.ctx);
+    await this.lane.waitForIdle(this.ctx);
+    if (!r.ok) {
+      const tag = (r.error as { _tag?: string; message?: string })?._tag ?? "";
+      if (tag !== "NothingToCompact") throw new Error(String((r.error as { message?: string })?.message ?? tag));
+      return;
+    }
+    const v = r.value as { status?: string; error?: { code?: string; message?: string } };
+    if (v.status === "failed" && v.error) {
+      const err = new Error(v.error.message ?? v.error.code ?? "run failed") as Error & { code?: string };
+      err.code = v.error.code;
+      throw err;
+    }
   }
 
   /**
@@ -1151,7 +1171,6 @@ export class ForgeAgent {
       "若有需还原的改动，先还原再给结论。",
     ].join("\n");
     this.audit.write({ kind: "prompt", preview: "[收尾自审] 最小化复查(git diff)" });
-    await this.lane.prompt(review, undefined, this.ctx);
-    await this.lane.waitForIdle(this.ctx);
+    await this.promptLane(review);
   }
 }
