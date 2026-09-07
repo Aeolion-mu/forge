@@ -97,6 +97,13 @@ export function App({
   const [newCount, setNewCount] = useState(0);
   // 鼠标点击输入框 → 请求把光标移到该列（消费后置 null）。
   const [cursorCol, setCursorCol] = useState<number | null>(null);
+  // 右下角浮动 toast（复制提示等）：单条、右对齐、自动消失、不进会话记录；新提示替换旧的。
+  const [toast, setToast] = useState<string | null>(null);
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 2500);
+    return () => clearTimeout(id);
+  }, [toast]);
   // 应用内选区（全局行号 + 可见列；anchor→active 归一化后渲染高亮）。单击清空、拖拽/双击/三击建立。
   const [sel, setSel] = useState<{ anchor: { line: number; col: number }; active: { line: number; col: number } } | null>(null);
   const selRef = useRef<typeof sel>(sel);
@@ -173,7 +180,7 @@ export function App({
     if (config.allowReadOutsideWorkdir) {
       lines.push(` ${ansi.amber("⚠ read-outside-workdir ON")} ${ansi.dim("— read-only tools may read outside workdir")}`);
     }
-    lines.push("", ansi.dim("滚轮回看 · 点击折叠展开 · 拖拽选择松开即复制 · 双击选词/三击选行 · /mouse 关 · /exit 退出"));
+    lines.push("");
     pushBlock({ kind: "banner", lines });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -575,7 +582,9 @@ export function App({
   const menuLines = menuOpen && !confirm ? menuMatches.length + 1 : 0;
   const subDashLines = agent.subTelemetry.turns > 0 ? 1 : 0;
   const subStatusLines = subStatus ? 1 : 0;
+  const toastLine = toast ? 1 : 0;
   const chromeHeight =
+    toastLine +
     jumpLine +
     reasoningLines.length +
     (busy ? 1 : 0) +
@@ -618,6 +627,7 @@ export function App({
   zonesRef.current = (() => {
     let row = viewportHeight; // 视口占 1..viewportHeight
     const z = { viewportRows: viewportHeight, jumpRow: null as number | null, menuTop: null as number | null, inputRow: null as number | null };
+    row += toastLine;
     row += jumpLine;
     if (jumpLine) z.jumpRow = row;
     row += reasoningLines.length;
@@ -647,7 +657,7 @@ export function App({
       const text = selectedText(flatRef.current.lines, normalizeRange(anchor, active));
       if (!text.trim()) return;
       const r = await copyText(text);
-      push(ansi.dim(`⧉ 已复制 ${text.length} 字符 → ${r.path}${r.note ? `（${r.note}）` : ""}`));
+      setToast(`⧉ 已复制 ${text.length} 字符 → ${r.path}`);
     },
     [push],
   );
@@ -775,6 +785,12 @@ export function App({
       <Box flexDirection="column" height={viewportHeight}>
         <Text>{viewportText}</Text>
       </Box>
+
+      {toast && (
+        <Box justifyContent="flex-end">
+          <Text color={theme.muted}>{toast}</Text>
+        </Box>
+      )}
 
       {scrollOffset > 0 && (
         <Box>
