@@ -47,11 +47,11 @@ export function expandHomePaths(paths: string[], home: string = homedir()): stri
   return paths.map((p) => (p === "~" ? home : p.startsWith("~/") ? home + p.slice(1) : p));
 }
 
-/** 命令的头部 token（豁免名单匹配用）：取第一个非空白段，剥掉路径前缀与环境前缀。 */
+/** 命令的头部 token（豁免名单匹配用）：取第一个非空白段，剥掉路径前缀、环境前缀与尾部分隔符（; & |）。 */
 export function headToken(cmd: string): string {
   const m = /^\s*(?:env\s+\S+\s+)*([^\s]+)/.exec(cmd);
   if (!m) return "";
-  return m[1]!.split("/").pop() ?? m[1]!;
+  return (m[1]!.split("/").pop() ?? m[1]!).replace(/[;&|]+$/, "");
 }
 
 /** 命令是否命中豁免名单（不沙箱执行）。 */

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { buildSandboxedCommand, resolveReadDeny, resolveRwPaths, detectSandboxCaps, type SandboxCaps } from "./bwrap.js";
 import { buildSeatbeltCommand, resolveSeatbeltPaths, seatbeltAvailable } from "./seatbelt.js";
@@ -46,7 +46,8 @@ export function setSandboxPolicy(p: SandboxPolicy | null): void {
       /* 清不掉就算了 */
     }
   }
-  sessionTmp = p?.enabled && activeStatus.backend === "seatbelt" ? mkdtempSync(`${tmpdir()}/forge-sandbox-`) : null;
+  sessionTmp =
+    p?.enabled && activeStatus.backend === "seatbelt" ? realpathSync(mkdtempSync(`${tmpdir()}/forge-sandbox-`)) : null; // realpath：/var → /private/var（SBPL 按解析后路径匹配）
 }
 
 /** 当前沙箱状态（启动横幅 / TUI 仪表盘用）。 */
