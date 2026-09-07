@@ -105,7 +105,7 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
                  │     ├─ on("session_before_compact") ─▶ 自研压缩（接管库原语） │
                  │     └─ subscribe()         ─▶ Telemetry + Ink TUI 渲染        │
                  │                                                              │
-                 │  systemPrompt: 主提示 + 环境块(PowerShell/sh) + skills + 记忆索引 │
+                 │  systemPrompt: 主提示 + 环境块(sh) + skills + 记忆索引                │
                  │  tools: 文件读写 / 搜索 / 代码智能 / bash / 子 Agent 编排        │
                  └──────────────────────────────────────────────────────────────┘
 ```
@@ -113,7 +113,7 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 | 文件 | 职责 |
 |---|---|
 | `src/kernel/forge-agent.ts` | 内核：包 `AgentHarness`，注入全部钩子、子 Agent 编排、压缩触发策略与熔断 |
-| `src/kernel/permission.ts` | 权限闸门：灾难命令硬拒绝（bash + PowerShell）+ 只读放行 + 写/执行确认 |
+| `src/kernel/permission.ts` | 权限闸门：灾难命令硬拒绝 + 只读放行 + 写/执行确认 |
 | `src/sandbox/exec.ts` | 沙箱执行：剔除密钥环境变量、关 stdin、超时杀整棵进程树、输出上限截断 |
 | `src/kernel/audit.ts` | 结构化审计日志（JSONL） |
 | `src/kernel/compaction.ts` | 上下文压缩纯逻辑：turn 对齐裁剪点 + 9 段摘要模板 + map-reduce 兜底 |
@@ -134,7 +134,7 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 ## 六个核心能力，对应 AgentHarness 的哪个口子
 
 1. **权限沙箱（`on("tool_call")` + `sandbox/exec.ts`）** — 工具调用不是模型说了算，先过一道确定性闸门：
-   `rm -rf /`、`mkfs`、fork bomb、`curl|sh`、PowerShell `iex(下载)` / `format-volume` / `diskpart clean` 等直接拒绝
+   `rm -rf /`、`mkfs`、fork bomb、`curl|sh` 等直接拒绝
    （即便 `/pass-permissions` 也硬拦）；写/执行类工具触发用户确认；只读工具放行。
    执行层再隔离一道：子进程**剔除所有像密钥的环境变量**（防 `echo $env:*_API_KEY` 泄密）、关 stdin、超时杀整棵进程树。
 2. **审计日志（`on("tool_call")` / `on("tool_result")`）** — 每一次「决策 / 调用 / 结果」落成结构化 JSONL（`.forge/audit.jsonl`），可事后复盘。
@@ -155,7 +155,7 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 
 - 基于 `pi-agent-core`（OpenClaw 的底层 agent runtime）的 `AgentHarness` 自研轻量**编程 Agent 框架内核 Forge**，
   自研内核 ~2000 行 / 共 ~4.7k 行 TypeScript（121 个单测），复刻最新一代编程 Agent 的核心机制。
-- 实现**权限沙箱**：在 `tool_call` 钩子上做确定性策略闸门（bash + PowerShell 双套灾难命令黑名单 + 只读放行 + 写操作确认），
+- 实现**权限沙箱**：在 `tool_call` 钩子上做确定性策略闸门（灾难命令黑名单 + 只读放行 + 写操作确认），
   工具调用无法绕过；执行层再隔离（剔密钥环境变量 / 超时杀进程树），配套结构化 **JSONL 审计日志**。
 - 设计**上下文工程层**：多文件记忆索引常驻注入 + 按需召回；超 90% 窗口接管压缩（turn 对齐裁剪 + 9 段摘要 +
   prompt 过长 map-reduce 兜底 + 连续失败熔断），对齐长上下文与记忆架构方案。

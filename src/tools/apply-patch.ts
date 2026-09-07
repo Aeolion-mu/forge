@@ -40,8 +40,8 @@ interface FileOp {
 function parsePatch(patch: string): FileOp[] {
   const ops: FileOp[] = [];
   let cur: FileOp | null = null;
-  // 按 \r?\n 切分：Windows 上 patch 文本常带 CRLF，残留的 \r 会让 *** File 标记正则
-  // 匹配失败（(.+)$ 卡在 \r 前），且污染 body 行内容。
+  // 按 \r?\n 切分：模型输出的 patch 文本可能带 CRLF（与宿主平台无关），残留的 \r
+  // 会让 *** File 标记正则匹配失败（(.+)$ 卡在 \r 前），且污染 body 行内容。
   for (const line of patch.split(/\r?\n/)) {
     if (line.startsWith("*** Begin Patch") || line.startsWith("*** End Patch")) continue;
     const upd = /^\*\*\* Update File:\s*(.+)$/.exec(line);

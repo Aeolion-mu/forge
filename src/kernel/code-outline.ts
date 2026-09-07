@@ -9,7 +9,7 @@ import { dirname, extname, join } from "node:path";
  * （业内标准：Aider repo map / AFT / Zed / Claude Code 的 LSP documentSymbol 都这么做，
  * 对 DeepSeek 这类非顶尖模型尤其能省上下文、降幻觉）。
  *
- * 解析用 web-tree-sitter（WASM，无原生编译，Windows 友好）+ tree-sitter-wasms 预编译语法。
+ * 解析用 web-tree-sitter（WASM，无原生编译依赖）+ tree-sitter-wasms 预编译语法。
  */
 
 export type SymbolKind =

@@ -142,10 +142,9 @@ export function resolveRwPaths(workdir: string, policy: SandboxPolicy): string[]
 }
 
 let _caps: SandboxCaps | null = null;
-/** 探测宿主沙箱能力（缓存）。Windows 直接 false；systemd-run 会真探一次 --user scope。 */
+/** 探测宿主沙箱能力（缓存）。systemd-run 会真探一次 --user scope。 */
 export function detectSandboxCaps(): SandboxCaps {
   if (_caps) return _caps;
-  if (process.platform === "win32") return (_caps = { bwrap: false, systemdRun: false });
   const bwrap = hasBin("bwrap");
   let systemdRun = false;
   if (hasBin("systemd-run")) {

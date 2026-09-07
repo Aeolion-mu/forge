@@ -36,10 +36,10 @@ const NO_PROFILES_HINT =
   '未配置任何 ssh 档案。请在 forge.config.json 的 "ssh" 段添加，例如：' +
   '"ssh": { "deploy": { "host": "1.2.3.4", "user": "ubuntu", "port": 22, "key": "~/.ssh/id_ed25519" } }，然后重启 forge。';
 
-/** ~ / ~/ 展开成用户主目录（Windows OpenSSH 不一定认 ~）。 */
+/** ~ / ~/ 展开成用户主目录（OpenSSH 不一定认 ~）。 */
 export function expandHome(p: string): string {
   if (p === "~") return homedir();
-  if (p.startsWith("~/") || p.startsWith("~\\")) return homedir() + p.slice(1);
+  if (p.startsWith("~/")) return homedir() + p.slice(1);
   return p;
 }
 
@@ -70,17 +70,10 @@ export function buildSshArgs(profile: SshProfile, command: string): string[] {
 let askpassPath: string | null = null;
 function ensureAskpass(): string {
   if (askpassPath) return askpassPath;
-  if (process.platform === "win32") {
-    const p = join(tmpdir(), "forge-ssh-askpass.cmd");
-    // PowerShell 读 env 原样输出：彻底避开 batch 对 & ! % ^ 等特殊字符的引号地狱
-    writeFileSync(p, `@powershell -NoProfile -Command "[Console]::Out.Write($env:${ASKPASS_PW_ENV})"\r\n`, "ascii");
-    askpassPath = p;
-  } else {
-    const p = join(tmpdir(), "forge-ssh-askpass.sh");
-    writeFileSync(p, `#!/bin/sh\nprintf '%s' "$${ASKPASS_PW_ENV}"\n`, "ascii");
-    chmodSync(p, 0o700);
-    askpassPath = p;
-  }
+  const p = join(tmpdir(), "forge-ssh-askpass.sh");
+  writeFileSync(p, `#!/bin/sh\nprintf '%s' "$${ASKPASS_PW_ENV}"\n`, "ascii");
+  chmodSync(p, 0o700);
+  askpassPath = p;
   return askpassPath;
 }
 

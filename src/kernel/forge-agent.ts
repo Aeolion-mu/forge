@@ -3,6 +3,7 @@ import {
   JsonlSessionRepo,
   formatSkillsForSystemPrompt,
   calculateContextTokens,
+  loadSkills,
 } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type {
@@ -29,7 +30,6 @@ import {
   type SummarizeFn,
 } from "./compaction.js";
 import { Memory } from "./memory.js";
-import { loadSkillsCrossPlatform } from "./skills-win.js";
 import { FlightRecorder, FileFlightSink } from "./flight-recorder.js";
 import { resolve } from "node:path";
 import { PermissionPolicy } from "./permission.js";
@@ -92,19 +92,12 @@ const MAIN_SYSTEM_PROMPT = [
 ].join("\n");
 
 /**
- * 本机环境特征 —— 注入系统提示，免得模型不知道自己在 PowerShell 里而频繁撞墙
- * （写 && / $VAR / ls 之类 POSIX 语法在 PowerShell 报错）。内容静态 → 不破坏前缀缓存。
- * 与 sandbox/exec.ts 的 shell 选择保持一致（win32 → powershell.exe）。
+ * 本机环境特征 —— 注入系统提示。内容静态 → 不破坏前缀缓存。
+ * 与 sandbox/exec.ts 的 shell 选择保持一致（恒 /bin/sh）。
  */
-export function environmentBlock(workdir: string, platform: NodeJS.Platform = process.platform): string {
-  if (platform === "win32") {
-    return [
-      `【运行环境】Windows · shell = PowerShell 5.1（powershell.exe）· 工作目录 ${workdir}`,
-      "bash 工具的命令实际在 PowerShell 里执行，请用 PowerShell 语法：用 `;` 或换行连接命令（5.1 不支持 `&&`/`||`）；环境变量是 `$env:NAME`（不是 `$NAME`）；用 cmdlet（Get-ChildItem / Get-Content / Remove-Item 等）而非 ls/cat/rm；路径含空格要加引号。读文件优先用 read_file 工具而非 Get-Content。",
-    ].join("\n");
-  }
+export function environmentBlock(workdir: string): string {
   return [
-    `【运行环境】${platform} · shell = /bin/sh · 工作目录 ${workdir}`,
+    `【运行环境】${process.platform} · shell = /bin/sh · 工作目录 ${workdir}`,
     "bash 工具的命令在 /bin/sh 里执行，请用 POSIX sh 语法。读文件优先用 read_file 工具而非 cat。",
   ].join("\n");
 }
@@ -421,7 +414,7 @@ export class ForgeAgent {
     }
 
     const memory = new Memory(config.workdir);
-    const { skills } = await loadSkillsCrossPlatform(env, config.skillsDirs);
+    const { skills } = await loadSkills(env, config.skillsDirs);
     const lsp = new LspClient(config.workdir); // 惰性：构造不 spawn，首次查询才起 server
 
     // 进程级注入沙箱策略：之后所有 execSandboxed（bash/diagnostics）在 Linux+bwrap 上自动受管。

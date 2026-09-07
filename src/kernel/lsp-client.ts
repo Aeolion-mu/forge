@@ -91,12 +91,11 @@ const IGNORE_DIRS = new Set([
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * 把 URI 归一成稳定的 map key：不同来源对盘符大小写/编码不一致
- * （我方 file:///C:/…，pyright file:///c%3A/…）。转成文件路径，Windows 再小写。
+ * 把 URI 归一成稳定的 map key：不同来源对百分号编码等不一致
+ * （我方 file:///a%20b/…，server file:///a b/…），fileURLToPath 统一解码成文件路径。
  */
 function uriKey(uri: string): string {
-  const p = fileURLToPath(uri);
-  return process.platform === "win32" ? p.toLowerCase() : p;
+  return fileURLToPath(uri);
 }
 
 /** 递归收集 root 下指定扩展名的文件（绝对路径），跳过忽略目录，限量。 */
@@ -246,12 +245,12 @@ export class LspClient {
     }
   }
 
-  /** uri → 相对 workdir 的 posix 路径（Windows 盘符大小写不敏感比较）；workdir 外则返回绝对路径。 */
+  /** uri → 相对 workdir 的 posix 路径（大小写敏感比较，Linux 文件系统本就敏感）；workdir 外则返回绝对路径。 */
   private relFromUri(uri: string): string {
     const abs = fileURLToPath(uri);
     const base = resolve(this.workdir);
-    const inside = abs.toLowerCase().startsWith(base.toLowerCase());
-    return inside ? abs.slice(base.length).replace(/^[\\/]/, "").split("\\").join("/") : abs;
+    const inside = abs === base || abs.startsWith(base + "/");
+    return inside ? abs.slice(base.length).replace(/^\/+/, "") : abs;
   }
 
   /** 把 LSP Location/LocationLink 归一化为相对路径 + 1-based。 */

@@ -3,9 +3,9 @@ import { buildSandboxedCommand, resolveRwPaths, detectSandboxCaps, type SandboxP
 
 /**
  * 沙箱执行层 —— 工具（目前是 bash）在受限子进程里跑：
- *   · 擦除密钥的环境变量（防 `echo $env:XXX_API_KEY` 泄漏 / prompt 注入偷 key）
+ *   · 擦除密钥的环境变量（防 `echo $XXX_API_KEY` 泄漏 / prompt 注入偷 key）
  *   · 关闭 stdin（不完整命令不再阻塞读 stdin 卡死）
- *   · 超时杀**整棵进程树**（Windows taskkill /T，POSIX 进程组）
+ *   · 超时杀**整棵进程树**（POSIX 进程组）
  *   · 输出字节上限，超出即截断并终止
  *
  * 诚实边界（纯 Node + 无容器）：限不了 CPU/内存、拦不了网络、挡不住命令往任意
@@ -55,14 +55,13 @@ export function setSandboxPolicy(p: SandboxPolicy | null): void {
   activePolicy = p;
 }
 
-/** 在受限子进程里执行一条命令（shell-string，经 PowerShell/sh；Linux 上再叠 bwrap 硬沙箱）。 */
+/** 在受限子进程里执行一条命令（shell-string，经 /bin/sh；Linux 上再叠 bwrap 硬沙箱）。 */
 export function execSandboxed(cmd: string, opts: SandboxExecOptions): Promise<SandboxExecResult> {
-  const isWin = process.platform === "win32";
   const spawnOpts = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes, env: scrubbedEnv(), signal: opts.signal };
 
-  // Linux 硬沙箱：策略开启 + 装了 bwrap → bwrap(+cgroup/rlimits) 包一层；否则优雅降级到原行为。
+  // Linux 硬沙箱：策略开启 + 装了 bwrap → bwrap(+cgroup) 包一层；否则优雅降级到原行为。
   const policy = opts.policy ?? activePolicy;
-  if (!isWin && policy?.enabled) {
+  if (policy?.enabled) {
     const caps = detectSandboxCaps();
     if (caps.bwrap) {
       const rwPaths = resolveRwPaths(opts.cwd, policy);
@@ -71,10 +70,7 @@ export function execSandboxed(cmd: string, opts: SandboxExecOptions): Promise<Sa
     }
   }
 
-  const shell = isWin ? "powershell.exe" : "/bin/sh";
-  // -NonInteractive：禁止 PowerShell 续行/交互提示（配合关闭 stdin，双保险防卡死）。
-  const args = isWin ? ["-NoProfile", "-NonInteractive", "-Command", cmd] : ["-c", cmd];
-  return spawnCaptured(shell, args, spawnOpts);
+  return spawnCaptured("/bin/sh", ["-c", cmd], spawnOpts);
 }
 
 export interface SpawnCapturedOptions {
@@ -91,11 +87,10 @@ export interface SpawnCapturedOptions {
 /**
  * argv 形态的受限 spawn —— execSandboxed 与 ssh 工具共用：关 stdin（EOF 防卡死）、
  * 超时杀整棵进程树、输出字节上限。**直接 spawn 可执行文件 + argv，不经 shell**，
- * 故远程命令/参数无需再过 PowerShell 引号转义。stdout/stderr 合并到一份文本。
+ * 故远程命令/参数无需再过引号转义。stdout/stderr 合并到一份文本。
  */
 export function spawnCaptured(file: string, args: string[], opts: SpawnCapturedOptions = {}): Promise<SandboxExecResult> {
   const started = Date.now();
-  const isWin = process.platform === "win32";
   const timeoutMs = opts.timeoutMs ?? 15000;
   const maxBytes = opts.maxBytes ?? 1024 * 1024;
 
@@ -109,9 +104,8 @@ export function spawnCaptured(file: string, args: string[], opts: SpawnCapturedO
     const child = spawn(file, args, {
       cwd: opts.cwd,
       env: opts.env ?? scrubbedEnv(), // ← 关键：子进程拿不到 API key
-      windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"], // ← 关键：stdin 直接 EOF，命令读不到输入也不会阻塞
-      detached: !isWin, // POSIX：自成进程组，便于整组杀
+      detached: true, // 自成进程组，便于整组杀
     });
 
     let buf = "";
@@ -123,11 +117,7 @@ export function spawnCaptured(file: string, args: string[], opts: SpawnCapturedO
 
     const killTree = () => {
       try {
-        if (isWin) {
-          if (child.pid) spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true });
-        } else if (child.pid) {
-          process.kill(-child.pid, "SIGKILL");
-        }
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
       } catch {
         /* 进程可能已退出 */
       }
@@ -152,7 +142,7 @@ export function spawnCaptured(file: string, args: string[], opts: SpawnCapturedO
     }, timeoutMs);
 
     // 外部 AbortSignal（Ctrl+C / harness abort）：立刻 kill 进程树并以 aborted=true 返回，
-    // 不等 child 'close' —— taskkill 在 Windows 上有时落地慢，等下来用户感觉「Ctrl+C 没反应」。
+    // 不等 child 'close' —— 免得「close 迟迟不来，用户感觉 Ctrl+C 没反应」。
     const onAbort = () => {
       aborted = true;
       killTree();

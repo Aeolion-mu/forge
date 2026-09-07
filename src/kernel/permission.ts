@@ -22,10 +22,8 @@ export interface PermissionDecision {
 
 /**
  * 即便用户点了确认也绝不放行的命令模式（不可逆 / 自毁 / 远程执行）。
- * forge 同时跑在 Linux(bash) 与 Windows(PowerShell)，两套 shell 的灾难命令都要拦。
  */
 const HARD_DENY_PATTERNS: { re: RegExp; why: string }[] = [
-  // ── Unix / bash ──
   { re: /\brm\s+-[a-z]*r[a-z]*f?\s+(\/|~|\$HOME|\*)/i, why: "递归删除根 / 家目录" },
   { re: /\bmkfs(\.\w+)?\b/i, why: "格式化文件系统" },
   { re: /\bdd\s+.*of=\/dev\/(sd|nvme|disk)/i, why: "裸写块设备" },
@@ -33,27 +31,6 @@ const HARD_DENY_PATTERNS: { re: RegExp; why: string }[] = [
   { re: /\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(ba)?sh\b/i, why: "下载脚本直接管道执行" },
   { re: />\s*\/dev\/(sd|nvme|disk)/i, why: "重定向覆盖块设备" },
   { re: /\bchmod\s+-R\s+777\s+\//i, why: "对根目录放开全部权限" },
-
-  // ── Windows / PowerShell / cmd ──
-  // 递归删除 盘符根 / 系统目录 / 家目录（Remove-Item 及别名 rm/ri/rd/rmdir/del/erase + -Recurse + 危险目标）
-  {
-    re: /(?=[\s\S]*\b(?:remove-item|ri|rd|rmdir|del|erase|rm)\b)(?=[\s\S]*-r[a-z]*\b)(?=[\s\S]*(?:[A-Za-z]:\\(?:\*|\s|"|'|;|$)|[A-Za-z]:\\(?:windows|users|program ?files)\\?(?:\*|\s|"|'|;|$)|\$env:(?:systemroot|windir|userprofile|programfiles)|\$home\b|\$profile\b|~[\\/]))/i,
-    why: "PowerShell 递归删除盘符根 / 系统 / 家目录",
-  },
-  // cmd 风格递归删除盘符 / 系统目录（rd /s、del /s）
-  { re: /\b(?:rd|rmdir|del|erase)\b[\s\S]*\/s\b[\s\S]*(?:[A-Za-z]:\\(?:\*|\s|"|'|;|$)|[A-Za-z]:\\(?:windows|users|program ?files)\\?(?:\*|\s|"|'|;|$)|%(?:systemroot|userprofile|windir)%)/i, why: "cmd 递归删除盘符 / 系统目录" },
-  // 格式化卷 / 清空磁盘
-  { re: /\b(?:format-volume|clear-disk)\b/i, why: "PowerShell 格式化卷 / 清空磁盘" },
-  { re: /\bdiskpart\b[\s\S]*\bclean\b/i, why: "diskpart 清空磁盘" },
-  { re: /\bformat\s+[A-Za-z]:/i, why: "格式化磁盘分区" },
-  // 下载内容直接执行（curl|sh 的 PowerShell 等价：| iex / iex(下载)）
-  { re: /\b(?:iwr|irm|curl|wget|invoke-webrequest|invoke-restmethod)\b[\s\S]*\|\s*(?:iex|invoke-expression)\b/i, why: "下载脚本直接执行（| iex）" },
-  { re: /\b(?:iex|invoke-expression)\b[\s\S]*(?:downloadstring|downloadfile|net\.webclient|iwr\b|irm\b|invoke-webrequest|invoke-restmethod)/i, why: "下载脚本直接执行（iex）" },
-  // 递归删除注册表项
-  { re: /(?=[\s\S]*\bremove-item\b)(?=[\s\S]*-r[a-z]*\b)(?=[\s\S]*\bhk(?:lm|cu|cr|cc|u):\\)/i, why: "递归删除注册表项" },
-  // 删除启动配置 / fork bomb（无限派生进程）
-  { re: /\bbcdedit\b[\s\S]*\/delete/i, why: "删除启动配置（bcdedit /delete）" },
-  { re: /while\s*\(\s*(?:\$true|1)\s*\)\s*\{[\s\S]*start-(?:process|job)\b/i, why: "PowerShell fork bomb（无限派生进程）" },
 ];
 
 /** 默认放行的只读工具（无副作用）。code-intel/LSP 查询类均只读；rename 会改文件不在此列。 */
@@ -78,38 +55,27 @@ const READONLY_TOOLS = new Set([
 // 隔离（容器/VM）。配合「每条 bash 全量落审计」与用户复核作兜底。设 FORGE_ALLOW_WRITE_OUTSIDE=1 关闭。
 
 const WRITE_CMD_RE =
-  /\b(cp|mv|dd|ln|install|rsync|tee|touch|mkdir)\b|\b(out-file|set-content|add-content|new-item|copy-item|move-item|rename-item|tee-object|export-csv|export-clixml)\b|\b(copy|move|xcopy|robocopy)\b/i;
+  /\b(cp|mv|dd|ln|install|rsync|tee|touch|mkdir)\b|\b(copy|move|xcopy|robocopy)\b/i;
 
 /** 把命令里的一个路径 token 解析成绝对路径；null sink / 文件描述符 → null（不算路径）。 */
 function resolvePathToken(token: string, workdir: string): string | null {
   let t = token.trim().replace(/^["']|["']$/g, "");
   if (!t || /^&?\d*$/.test(t) || /^&\d+$/.test(t)) return null; // 2>&1 / >&2 之类的 fd
-  if (/^(\/dev\/null|nul)$/i.test(t)) return null; // 空洞
+  if (/^\/dev\/null$/i.test(t)) return null; // 空洞
   const home = homedir();
-  t = t
-    .replace(/^~(?=[\\/]|$)/, home)
-    .replace(/\$HOME\b/g, home)
-    .replace(/\$env:USERPROFILE/gi, home)
-    .replace(/%USERPROFILE%/gi, home);
+  t = t.replace(/^~(?=\/|$)/, home).replace(/\$HOME\b/g, home);
   return resolve(workdir, t);
 }
 
-/** 绝对路径是否在 workdir 之外（win32 大小写不敏感）。 */
+/** 绝对路径是否在 workdir 之外。 */
 function isOutsideWorkdir(abs: string, workdir: string): boolean {
-  const norm = (s: string) => (process.platform === "win32" ? s.toLowerCase() : s);
-  const a = norm(abs);
-  const w = norm(workdir);
-  return a !== w && !a.startsWith(w + sep);
+  return abs !== workdir && !abs.startsWith(workdir + sep);
 }
 
-/** 抽出命令里像「绝对路径」的 token（Windows 盘符 / UNC / POSIX 绝对路径，排除 // 开头的 URL/UNC 误判）。 */
+/** 抽出命令里像「绝对路径」的 token（POSIX 绝对路径，排除 // 开头的 URL 误判）。 */
 function absPathTokens(cmd: string): string[] {
   const out: string[] = [];
-  for (const re of [/[A-Za-z]:[\\/][^\s"'|;&>]*/g, /\\\\[^\s"'|;&>]+/g]) {
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(cmd))) out.push(m[0]);
-  }
-  const posix = /(?:^|[\s=:"'(])(\/(?!\/)[^\s"'|;&>]*)/g; // 前导 / 但非 //（避开 http:// 与 UNC）
+  const posix = /(?:^|[\s=:"'(])(\/(?!\/)[^\s"'|;&>]*)/g; // 前导 / 但非 //（避开 http://）
   let m: RegExpExecArray | null;
   while ((m = posix.exec(cmd))) out.push(m[1]);
   return out;
@@ -122,11 +88,11 @@ function hasWriteSignal(cmd: string): boolean {
 
 /**
  * 命令里是否有 `cd`/`pushd` 等把工作目录切到 **workdir 之外** 的目标。
- * 关键：**解析 cd 目标的真实路径再判**，而不是看「是不是绝对盘符路径」这种语法形状——
- * 否则 `cd C:\…\workdir\sub`（进 workdir 子目录，Windows 上最自然的写法）会被误判成逃逸。
+ * 关键：**解析 cd 目标的真实路径再判**，而不是看「是不是绝对路径」这种语法形状——
+ * 否则 `cd /abs/workdir/sub`（进 workdir 子目录）会被误判成逃逸。
  */
 function cdEscapesWorkdir(cmd: string, workdir: string): boolean {
-  const re = /\b(?:cd|chdir|pushd|set-location|sl)\b\s+("[^"]*"|'[^']*'|[^\s;|&]+)/gi;
+  const re = /\b(?:cd|chdir|pushd)\b\s+("[^"]*"|'[^']*'|[^\s;|&]+)/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(cmd))) {
     const abs = resolvePathToken(m[1], workdir);
