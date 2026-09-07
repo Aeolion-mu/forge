@@ -23,8 +23,6 @@ import type {
   Skill,
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-// 0.85 起 pi-ai 根入口不再导出这些函数；/compat 是官方临时 shim（签名不变）。
-import { completeSimple, getEnvApiKey } from "@earendil-works/pi-ai/compat";
 import type { Api, AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import { hasKey, resolveModel, type ForgeConfig, type ModelEntry } from "../config.js";
 import { getModels } from "./models.js";
@@ -500,6 +498,15 @@ export class ForgeAgent {
     ];
 
     // 0.85：异步工厂 create()；env/auth 选项没了（auth 归 Models），models 必填。
+    // 压缩设置按有效窗口等比缩放：config 里的 reserve/keep 是按真实窗口调的，虚拟窗口
+    // （maxContextTokens 压测）下若不缩放，库默认压缩会「全保留 + 加摘要」→ 上下文不缩反涨、循环压缩。
+    const realWindow = config.model.contextWindow;
+    const effective = config.maxContextTokens && config.maxContextTokens > 0 && config.maxContextTokens < realWindow ? config.maxContextTokens : realWindow;
+    const compactionSettings = {
+      enabled: false, // 关库内置阈值触发（虚拟窗口由 forge maybeCompact 管）；手动 compact 不受影响
+      reserveTokens: Math.min(config.compaction.reserveTokens, Math.floor(0.1 * effective)),
+      keepRecentTokens: Math.min(config.compaction.keepRecentTokens, Math.floor(0.2 * effective)),
+    };
     const { harness } = await AgentHarness.create(
       {
         session,
@@ -510,7 +517,7 @@ export class ForgeAgent {
         streamOptions: streamOptionsOf(config), // 单请求退避重试（OpenAI SDK 内置）
         thinkingLevel: config.thinkingLevel, // reasoning 拉满（DeepSeek → reasoning_effort:max）
         steeringMode: "all", // 忙时插话：当前 turn 边界一次性注入全部排队消息（库默认 one-at-a-time 会分多 turn 喂）
-        compaction: { ...config.compaction, enabled: false }, // 关库内置阈值触发（虚拟窗口由 forge maybeCompact 管）；手动 compact 不受影响
+        compaction: compactionSettings,
         systemPrompt: () => {
           const parts = [MAIN_SYSTEM_PROMPT, environmentBlock(config.workdir)];
           if (skills.length) parts.push(formatSkillsForSystemPrompt(skills));
@@ -792,16 +799,18 @@ export class ForgeAgent {
   /** 用 flash 给「主 agent 这一轮的最后消息」做三分类（claims_done / asking_user / blocked）。 */
   private async classifyStop(lastMessage: string): Promise<StopKind> {
     const { model } = this.resolvePreferredModel("deepseek/deepseek-v4-flash");
-    const apiKey = getEnvApiKey(model.provider);
-    if (!apiKey) return "asking_user"; // 没 key → 交回用户（保守）
     try {
       const messages = [{ role: "user", content: [{ type: "text", text: buildClassifierPrompt(lastMessage) }], timestamp: Date.now() }] as Message[];
-      const resp = await completeSimple(model, { systemPrompt: CLASSIFIER_SYSTEM_PROMPT, messages }, { maxTokens: 16, apiKey });
+      const resp = await getModels(this.config.customModels).completeSimple(
+        model,
+        { systemPrompt: CLASSIFIER_SYSTEM_PROMPT, messages },
+        { maxTokens: 16 },
+      );
       if (resp.stopReason === "error" || resp.stopReason === "aborted") return "asking_user";
       const text = resp.content.filter((c) => (c as { type: string }).type === "text").map((c) => (c as { text: string }).text).join("");
       return parseClassification(text);
     } catch {
-      return "asking_user";
+      return "asking_user"; // 含 provider 未配置 → 交回用户（保守）
     }
   }
 
@@ -814,19 +823,21 @@ export class ForgeAgent {
   private async runWriteGuard(command: string, instruction: string): Promise<{ block: { reason: string } } | undefined> {
     if (!command) return undefined;
     const { model } = this.resolvePreferredModel("deepseek/deepseek-v4-flash");
-    const apiKey = getEnvApiKey(model.provider);
-    if (!apiKey) return undefined; // 没 key → 放行（fail-open）
     try {
       const prompt = buildWriteGuardPrompt({ command, workdir: this.config.workdir, userInstruction: instruction });
       const messages = [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] as Message[];
-      const resp = await completeSimple(model, { systemPrompt: WRITE_GUARD_SYSTEM_PROMPT, messages }, { maxTokens: 200, apiKey });
+      const resp = await getModels(this.config.customModels).completeSimple(
+        model,
+        { systemPrompt: WRITE_GUARD_SYSTEM_PROMPT, messages },
+        { maxTokens: 200 },
+      );
       if (resp.stopReason === "error" || resp.stopReason === "aborted") return undefined;
       const text = resp.content.filter((c) => (c as { type: string }).type === "text").map((c) => (c as { text: string }).text).join("");
       const v = parseWriteGuardVerdict(text);
       if (v.verdict === "deny") return { block: { reason: `越界写入被拦截（语义守卫）：${v.reason}（确需可设 FORGE_ALLOW_WRITE_OUTSIDE=1）` } };
       return undefined;
     } catch {
-      return undefined; // 守卫自身故障不卡主流程
+      return undefined; // 守卫自身故障（含 provider 未配置）不卡主流程 → 放行（fail-open）
     }
   }
 
@@ -898,19 +909,19 @@ export class ForgeAgent {
     }
   }
 
-  /** 注入给 runFullCompaction 的「调一次模型做摘要」回调（用 pi-ai /compat 的 completeSimple）。 */
+  /** 注入给 runFullCompaction 的「调一次模型做摘要」回调（Models.completeSimple，auth 由 provider 自解析、keyless 端点也通）。 */
   private makeSummarizeFn(): SummarizeFn {
     const model = this.currentModel;
     const reserve = this.config.compaction.reserveTokens;
     const thinking = this.config.thinkingLevel;
     return async ({ systemPrompt, userPrompt }) => {
-      const apiKey = getEnvApiKey(model.provider);
-      if (!apiKey) return { ok: false, text: "", errorMessage: "compaction needs an API key but the current provider has none" };
+      // Models.completeSimple：auth 由 provider 自解析（keyless 内网端点也通），不再手工查 env key。
+      // 第 2 参是 AI 请求载体（systemPrompt/messages），取消信号走 options.signal。
       const maxTokens = Math.min(Math.floor(0.8 * reserve), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
-      const base = { maxTokens, apiKey, signal: this.currentAbort?.signal };
+      const base = { maxTokens, signal: this.currentAbort?.signal };
       const opts = model.reasoning && thinking !== "off" ? { ...base, reasoning: thinking } : base;
       const messages = [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }] as Message[];
-      const resp = await completeSimple(model, { systemPrompt, messages }, opts);
+      const resp = await getModels(this.config.customModels).completeSimple(model, { systemPrompt, messages }, opts);
       if (resp.stopReason === "aborted") return { ok: false, text: "", errorMessage: "summarization aborted" };
       if (resp.stopReason === "error") return { ok: false, text: "", tooLong: isTooLongError(resp.errorMessage), errorMessage: resp.errorMessage };
       const text = resp.content.filter((c) => (c as { type: string }).type === "text").map((c) => (c as { text: string }).text).join("\n");
