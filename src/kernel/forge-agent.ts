@@ -528,9 +528,11 @@ export class ForgeAgent {
 
   // ── /resume · /rewind 支持 ────────────────────────────────────────────────
 
-  /** 当前活跃路径的全部会话条目（TUI 挂载重放 / rewind 重建共用）。 */
+  /** 当前活跃路径的全部会话条目，**时间正序**（最旧在前）——TUI 挂载重放 / rewind 重建 / userTurns 共用。
+   *  findEntries 返回 tip→根的逆序（实测 seq 递减），直接渲染会把最新消息画在最上面。 */
   async conversationEntries(): Promise<Entry[]> {
-    return this.lane.findEntries(undefined, this.ctx);
+    const entries = await this.lane.findEntries(undefined, this.ctx);
+    return entries.reverse();
   }
 
   /** 活跃路径上的真实用户消息（跳过 toolResult），倒序（最新在前），供 /rewind 选择器。

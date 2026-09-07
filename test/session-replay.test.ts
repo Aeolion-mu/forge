@@ -52,6 +52,20 @@ test("replay：孤儿 toolResult 单独落 plain 不丢数据；错误结果 isE
   assert.equal(blocks[0]!.kind, "plain");
 });
 
+test("replay：按输入顺序渲染——时间正序输入 → 最旧在最上、最新在最下", () => {
+  // findEntries 返回 tip→根逆序（实测 seq 递减），conversationEntries 负责翻正后喂进来；
+  // replayBlocks 本身不排序（纯函数），此测试钉住「正序进 → 正序出」的契约。
+  const blocks = replayBlocks([
+    msg("user", { content: "第一条" }),
+    msg("assistant", { content: [{ type: "text", text: "回复一" }] }),
+    msg("user", { content: "第二条" }),
+    msg("assistant", { content: [{ type: "text", text: "回复二" }] }),
+  ]);
+  const texts = blocks.map((b) => (b as { text?: string; source?: string }).text ?? (b as { source?: string }).source ?? "");
+  assert.equal(texts[0], "第一条"); // 最旧在最上
+  assert.equal(texts[3], "回复二"); // 最新在最下
+});
+
 test("replay：compaction 条目 → 提示块", () => {
   const blocks = replayBlocks([
     { id: `e${idc++}`, parentId: null, seq: idc, timestamp: 0, type: "compaction", summary: "S".repeat(500), retainedTail: [], tokensBefore: 1, fromHook: false } as unknown as Entry,
