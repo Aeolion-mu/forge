@@ -5,7 +5,7 @@ import { getEnvApiKey, getModel } from "@earendil-works/pi-ai/compat";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { DEFAULT_RMB_PER_M, type Rate } from "./kernel/pricing.js";
-import { defaultWritePaths, type SandboxPolicy } from "./sandbox/bwrap.js";
+import { defaultWritePaths, defaultReadDeny, expandHomePaths, type SandboxPolicy } from "./sandbox/policy.js";
 import { buildCustomModel, type CustomModelEntry } from "./kernel/models.js";
 
 /** forge.config.json 里的一条可选模型。 */
@@ -64,8 +64,6 @@ export interface ForgeConfig {
   pricing: Record<string, Rate>;
   /** 只读越界：允许 read_file/list_dir/glob/grep 读 workdir 外的绝对路径（写仍锁死 workdir）。默认 false。 */
   allowReadOutsideWorkdir: boolean;
-  /** 关闭 bash 写边界守卫（FORGE_ALLOW_WRITE_OUTSIDE=1）。默认 false（守卫开启）。 */
-  allowWriteOutside: boolean;
   /** 虚拟上下文窗口上限（token）：设了就用它替代真实 contextWindow 算压缩触发(0.9)与保留(0.2)。
    *  用途：DeepSeek 1M 窗口压测太贵，降到如 200000 可低成本验证压缩质量。不设=用真实窗口。 */
   maxContextTokens?: number;
@@ -279,6 +277,14 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
         if (Array.isArray(s.writePaths) && s.writePaths.every((p) => typeof p === "string")) sb.writePaths = s.writePaths as string[];
         else issues.push("sandbox.writePaths 应为字符串数组（绝对路径）");
       }
+      if (s.readDeny !== undefined) {
+        if (Array.isArray(s.readDeny) && s.readDeny.every((p) => typeof p === "string")) sb.readDeny = s.readDeny as string[];
+        else issues.push("sandbox.readDeny 应为字符串数组（绝对路径，支持 ~）");
+      }
+      if (s.excluded !== undefined) {
+        if (Array.isArray(s.excluded) && s.excluded.every((p) => typeof p === "string")) sb.excluded = s.excluded as string[];
+        else issues.push("sandbox.excluded 应为字符串数组（命令头 token，如 brew）");
+      }
       out.sandbox = sb;
     }
   }
@@ -379,7 +385,6 @@ export function loadConfig(): ForgeConfig {
     // 内置定价 ⊕ 配置覆盖（配置同 ref 优先）
     pricing: { ...DEFAULT_RMB_PER_M, ...file.pricing },
     allowReadOutsideWorkdir: process.env.FORGE_ALLOW_READ_OUTSIDE === "1" || file.allowReadOutsideWorkdir || false,
-    allowWriteOutside: process.env.FORGE_ALLOW_WRITE_OUTSIDE === "1",
     ...(process.env.FORGE_MAX_CONTEXT_TOKENS || file.maxContextTokens
       ? { maxContextTokens: Number(process.env.FORGE_MAX_CONTEXT_TOKENS ?? file.maxContextTokens) }
       : {}),
@@ -390,15 +395,19 @@ export function loadConfig(): ForgeConfig {
     },
     ssh: file.ssh ?? {}, // 仅来自 forge.config.json；非空才注册 ssh_run 工具
     sandbox: {
-      // 默认开（仅 Linux+bwrap 实际生效，否则降级）；FORGE_SANDBOX=0 一键关。
+      // 默认开（Linux→bwrap / macOS→sandbox-exec，无后端大声降级）；FORGE_SANDBOX=0 一键关。
       enabled: process.env.FORGE_SANDBOX === "0" ? false : file.sandbox?.enabled ?? true,
       // D1：默认联网（npm/pip/git）；FORGE_SANDBOX_NET=0 或配置断网。
       network: process.env.FORGE_SANDBOX_NET === "0" ? false : file.sandbox?.network ?? true,
-      // D2：只读根之外的可写口；不配则用 /tmp + HOME 常用缓存默认。
-      writePaths: file.sandbox?.writePaths ?? defaultWritePaths(),
-      // D3：资源限额（systemd-run cgroup 优先，回退 ulimit；见 sandbox/bwrap.ts）。
+      // D2：只读根之外的可写口；默认 /tmp + HOME 常用缓存（**不含 ~/.config**——收紧旧默认）。
+      writePaths: expandHomePaths(file.sandbox?.writePaths ?? defaultWritePaths()),
+      // 读隐藏：默认禁读 ~/.ssh、~/.aws、~/.gnupg（防「读 key 走网络外传」）。
+      readDeny: expandHomePaths(file.sandbox?.readDeny ?? defaultReadDeny()),
+      // D3：资源限额（仅 Linux：systemd-run cgroup 优先，无 systemd 只隔离不限内存；macOS 无机制）。
       memMax: process.env.FORGE_SANDBOX_MEM ?? file.sandbox?.memMax ?? "2G",
       pidsMax: Number(process.env.FORGE_SANDBOX_PIDS ?? file.sandbox?.pidsMax ?? 512),
+      // 豁免名单：沙箱内不可嵌套沙箱（brew/swift test 等）——命中则不沙箱执行 + 警告。
+      excluded: file.sandbox?.excluded ?? (process.env.FORGE_SANDBOX_EXCLUDED ? process.env.FORGE_SANDBOX_EXCLUDED.split(",").map((s) => s.trim()).filter(Boolean) : []),
     },
   };
 }

@@ -6,6 +6,7 @@ import { ForgeAgent } from "./kernel/forge-agent.js";
 import { App, type AppBridge } from "./ui/app.js";
 import { renderBanner, ansi } from "./ui/theme.js";
 import { explainApiError } from "./kernel/errors.js";
+import { getSandboxStatus } from "./sandbox/exec.js";
 
 /** Ctrl+C / EOF 触发的中断。 */
 function isAbort(e: unknown): boolean {
@@ -18,6 +19,13 @@ function banner(config: ForgeConfig, mode: string): void {
   const live = config.live ? "\x1b[32m● LIVE\x1b[0m" : "\x1b[31m● no key\x1b[0m";
   stdout.write(`\n${renderBanner()}\n\n`);
   stdout.write(` ${ansi.dim("Terminal Coding Agent ·")} ${config.modelRef} ${ansi.dim("·")} ${live}\n`);
+  // 沙箱状态大声呈现（旧版静默降级的问题不再：没后端一眼可见）
+  const sb = getSandboxStatus();
+  if (sb.backend === "none" && sb.enabled) {
+    stdout.write(` ${ansi.amber("⚠ sandbox: NO BACKEND")} ${ansi.dim(`— 命令未沙箱（仅环境白名单清洗）。${sb.reason}`)}\n`);
+  } else if (sb.backend !== "none") {
+    stdout.write(` ${ansi.dim("sandbox:")} ${sb.backend} ${ansi.dim(`(${sb.reason})`)}\n`);
+  }
   if (config.allowReadOutsideWorkdir) stdout.write(` ${ansi.amber("⚠ read-outside-workdir ON")} ${ansi.dim("— read-only tools may read outside workdir (writes still locked)")}\n`);
   stdout.write(` ${ansi.dim(mode)}\n\n`);
 }

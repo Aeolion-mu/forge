@@ -41,7 +41,6 @@ import { Memory } from "./memory.js";
 import { FlightRecorder, FileFlightSink } from "./flight-recorder.js";
 import { resolve } from "node:path";
 import { PermissionPolicy } from "./permission.js";
-import { WRITE_GUARD_SYSTEM_PROMPT, buildWriteGuardPrompt, parseWriteGuardVerdict } from "./write-guard.js";
 import { Telemetry } from "./telemetry.js";
 import { makeMemoryTools } from "../tools/memory-tool.js";
 import { makeBashTool } from "../tools/bash.js";
@@ -291,9 +290,6 @@ export class ForgeAgent {
   private runChangedFiles = new Set<string>();
   /** 主 agent 本轮是否调了 submit_for_review（及理由）；checkConverge 读后清空。 */
   private pendingSubmit?: { justification: string };
-  /** 本轮的用户指令（喂给语义写守卫判断意图；run() / runConvergent 进入时更新）。 */
-  private currentUserInstruction = "";
-
   private readonly lsp: LspClient;
 
   private constructor(
@@ -306,7 +302,7 @@ export class ForgeAgent {
     this.audit = new AuditLog(config.auditPath);
     this.flight = deps.flight;
     this.flightPath = deps.flightPath;
-    this.policy = new PermissionPolicy({ autoApprove: opts.autoApprove, workdir: config.workdir, allowWriteOutside: config.allowWriteOutside });
+    this.policy = new PermissionPolicy({ autoApprove: opts.autoApprove }); // 写边界在沙箱内核层（sandbox/），闸门只管灾难命令 + 确认
     this.live = config.live;
     this.currentRef = config.modelRef;
     this.currentModel = config.model;
@@ -329,10 +325,6 @@ export class ForgeAgent {
       const decision = this.policy.check(e.toolName, e.args);
       this.audit.write({ kind: "permission", tool: e.toolName, args: e.args, verdict: decision.verdict, reason: decision.reason });
       if (decision.verdict === "deny") return { block: { reason: decision.reason } };
-      if (decision.verdict === "review") {
-        const g = await this.runWriteGuard(String((e.args as { cmd?: unknown })?.cmd ?? ""), this.currentUserInstruction);
-        if (g) return g; // {block} 才拦；放行返回 undefined 继续后续流程
-      }
       if (decision.verdict === "confirm" && this.opts.confirm) {
         const ok = await this.opts.confirm(e.toolName, e.args);
         if (!ok) return { block: { reason: "用户拒绝了该操作" } };
@@ -762,8 +754,8 @@ export class ForgeAgent {
   /** 跑一次 Convergent 验收：fresh pro session + 只读+bash 工具 + 怀疑式 prompt + 硬拦灾难命令。 */
   private async runConvergent(goal: string, changedFiles: string[], claim: string): Promise<{ verdict: "yes" | "no"; reason: string }> {
     const { model, thinking } = this.resolvePreferredModel("deepseek/deepseek-v4-pro");
-    // 自主运行（autoApprove），但硬拒绝黑名单 + 写边界守卫仍生效（Convergent 的 bash 也不许写出 workdir）
-    const policy = new PermissionPolicy({ autoApprove: true, workdir: this.config.workdir, allowWriteOutside: this.config.allowWriteOutside });
+    // 自主运行（autoApprove），但硬拒绝黑名单仍生效（写边界由沙箱内核保证，与主 agent 同一套）
+    const policy = new PermissionPolicy({ autoApprove: true });
     const task = buildConvergentTask({ goal, changedFiles, agentClaim: claim });
     const ac = new AbortController();
     this.currentAbort = ac; // 允许 Ctrl+C 中止验收
@@ -779,13 +771,9 @@ export class ForgeAgent {
         flightTag: "convergent",
         telemetry: this.subTelemetry.handle, // 计入子用量（pro，会拉高该行均价）
         onEvent: (e) => this.opts.onConvergentEvent?.(e), // 活动实时显示（UI 加 ⟢ 前缀区分）
-        gate: async (toolName, input) => {
+        gate: (toolName, input) => {
           const d = policy.check(toolName, input);
-          if (d.verdict === "deny") return { block: { reason: d.reason } };
-          // review：Convergent 复现常 cd 进项目子目录跑只读分析，确定性层拿不准 → 交语义守卫
-          // （以验收任务为意图上下文）。这正是修掉「只读命令被误判越界、Convergent 空烧轮数」的关键。
-          if (d.verdict === "review") return await this.runWriteGuard(String((input as { cmd?: unknown })?.cmd ?? ""), goal);
-          return undefined;
+          return d.verdict === "deny" ? { block: { reason: d.reason } } : undefined;
         },
         onTurn: (turns) => this.status(`Convergent 取证核验中… (第 ${turns} 轮)`),
       });
@@ -814,32 +802,6 @@ export class ForgeAgent {
     }
   }
 
-  /**
-   * 语义写边界守卫：确定性层判 review（cd 到 workdir 外 + 含写信号）时调用。
-   * 用 flash·非思考带最小上下文（命令 + workdir + 本轮指令，不喂工具结果/agent 叙述）判一次。
-   * 返回 {block:{reason}} 表示拦截；undefined 表示放行。fail-open：无 key / 报错 / 解析不到裁决 → 放行
-   * （best-effort 边界，灾难命令已由 HARD_DENY 黑名单在确定性层硬拦，不会走到这里）。
-   */
-  private async runWriteGuard(command: string, instruction: string): Promise<{ block: { reason: string } } | undefined> {
-    if (!command) return undefined;
-    const { model } = this.resolvePreferredModel("deepseek/deepseek-v4-flash");
-    try {
-      const prompt = buildWriteGuardPrompt({ command, workdir: this.config.workdir, userInstruction: instruction });
-      const messages = [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] as Message[];
-      const resp = await getModels(this.config.customModels).completeSimple(
-        model,
-        { systemPrompt: WRITE_GUARD_SYSTEM_PROMPT, messages },
-        { maxTokens: 200 },
-      );
-      if (resp.stopReason === "error" || resp.stopReason === "aborted") return undefined;
-      const text = resp.content.filter((c) => (c as { type: string }).type === "text").map((c) => (c as { text: string }).text).join("");
-      const v = parseWriteGuardVerdict(text);
-      if (v.verdict === "deny") return { block: { reason: `越界写入被拦截（语义守卫）：${v.reason}（确需可设 FORGE_ALLOW_WRITE_OUTSIDE=1）` } };
-      return undefined;
-    } catch {
-      return undefined; // 守卫自身故障（含 provider 未配置）不卡主流程 → 放行（fail-open）
-    }
-  }
 
   /**
    * converge 循环的核心：一轮主 agent 结束后调用。
@@ -1135,7 +1097,6 @@ export class ForgeAgent {
     this.audit.write({ kind: "prompt", preview: input });
     // 0.85 的 run_start 事件不带 prompt —— user_input 飞行记录改在这里手动落。
     this.flight?.record("user_input", { prompt: input });
-    this.currentUserInstruction = input; // 供语义写守卫判断本轮意图
     this.runChangedFiles.clear();
     await this.promptLane(input);
     await this.maybeSelfReview(); // P1：本轮有写 → 强制一次 diff 自审，剔除无关改动（防过度编辑）

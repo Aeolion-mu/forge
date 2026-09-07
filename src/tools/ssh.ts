@@ -3,7 +3,8 @@ import { writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
-import { spawnCaptured, scrubbedEnv, signalOf } from "../sandbox/exec.js";
+import { spawnCaptured, signalOf } from "../sandbox/exec.js";
+import { whitelistEnv } from "../sandbox/policy-env.js";
 import { truncateForContext } from "../kernel/artifacts.js";
 import type { SshProfile } from "../config.js";
 
@@ -79,7 +80,7 @@ function ensureAskpass(): string {
 
 /** 密码模式下，给子进程环境注入 SSH_ASKPASS 三件套 + 密码（密码只在子进程 env，不落盘、不进日志）。 */
 function passwordEnv(password: string): NodeJS.ProcessEnv {
-  const base = scrubbedEnv();
+  const base = whitelistEnv();
   return {
     ...base,
     SSH_ASKPASS: ensureAskpass(),
@@ -117,7 +118,7 @@ export function makeSshTool(
         };
       }
       const args = buildSshArgs(profile, params.command);
-      const env = profile.password ? passwordEnv(profile.password) : scrubbedEnv();
+      const env = profile.password ? passwordEnv(profile.password) : whitelistEnv();
       const r = await spawnCaptured("ssh", args, { timeoutMs: params.timeoutMs ?? 30000, env, signal: signalOf(context) });
       const t = truncateForContext(r.out, { workdir: process.cwd(), save: true });
       return {

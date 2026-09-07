@@ -10,6 +10,7 @@ import { renderFileDiff, type FileDiff } from "./diff.js";
 import { matchCommands, menuShouldOpen, resolveSubmitted } from "./commands.js";
 import { createRunQueue } from "./run-queue.js";
 import { ctrlCAction } from "./keybinds.js";
+import { getSandboxStatus } from "../sandbox/exec.js";
 import { explainApiError } from "../kernel/errors.js";
 
 // 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
@@ -396,6 +397,14 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
   const win = agent.contextWindow;
   const pct = win ? Math.min(100, Math.round((dash.ctxUsed / win) * 100)) : 0;
   const model = config.modelRef.split("/")[1] ?? config.modelRef;
+  // 沙箱状态：正常低调显示后端名；降级琥珀色警示（旧版静默降级的问题不再）
+  const sb = getSandboxStatus();
+  const sandboxLine =
+    sb.backend === "none"
+      ? sb.enabled
+        ? <Text color={theme.amber}> · ⚠ 未沙箱</Text>
+        : ""
+      : ` · ${sb.backend}`;
   const frame = sparkFrame();
 
   return (
@@ -476,6 +485,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
           ▌ {model} · ctx {human(dash.ctxUsed)}/{human(win)} ({pct}%) · {dash.turns} turns · ↑{human(dash.inTok)} ↓
           {human(dash.outTok)} tok · cache {Math.round(dash.cacheHit * 100)}% · ¥{dash.cost.toFixed(4)}
           {bypass ? <Text color={theme.error}> · bypass</Text> : ""}
+          {sandboxLine}
         </Text>
       </Box>
 

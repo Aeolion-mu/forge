@@ -1,9 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PermissionPolicy, detectWriteEscape } from "../src/kernel/permission.js";
-
-const WD = "/work/proj";
-const OUT_ABS = "/etc/evil.txt";
+import { PermissionPolicy } from "../src/kernel/permission.js";
 
 const verdict = (cmd: string, autoApprove = false) =>
   new PermissionPolicy({ autoApprove }).check("bash", { cmd }).verdict;
@@ -24,18 +21,11 @@ test("写/执行类工具默认需确认", () => {
 });
 
 test("ssh_run：默认需确认；远程危险命令即便 autoApprove 也被 HARD_DENY 拦", () => {
-  const p = new PermissionPolicy({ autoApprove: true, workdir: WD });
+  const p = new PermissionPolicy({ autoApprove: true });
   // 正常远程命令：autoApprove 放行
   assert.equal(p.check("ssh_run", { profile: "deploy", command: "systemctl restart x" }).verdict, "allow");
   // 远程 rm -rf /：HARD_DENY 拦，autoApprove 也拦
   assert.equal(p.check("ssh_run", { profile: "deploy", command: "rm -rf /" }).verdict, "deny");
-});
-
-test("ssh_run：不套本地写边界守卫（远程重定向到绝对路径不被误杀）", () => {
-  const cmd = `echo x > ${OUT_ABS}`;
-  const p = new PermissionPolicy({ workdir: WD });
-  assert.equal(p.check("bash", { cmd }).verdict, "deny"); // bash 走写守卫
-  assert.equal(p.check("ssh_run", { profile: "deploy", command: cmd }).verdict, "confirm"); // ssh_run 不走，落到需确认
 });
 
 test("autoApprove / passAll 放行写类工具，但硬拒绝仍生效", () => {
@@ -74,67 +64,9 @@ test("良性命令不被误拦（含深层项目子目录删除）", () => {
     "rm -rf ./node_modules",
     "rm -rf ./build",
     "echo hello",
-  ];
-  for (const c of benign) assert.notEqual(verdict(c, false), "deny", c);
-});
-
-// ── bash 写边界守卫（detectWriteEscape）────────────────────────────────────────
-
-test("写边界守卫：确证越界写直接 deny（重定向 / 写命令到 workdir 外的具体目标）", () => {
-  const deny = [
-    `echo x > ${OUT_ABS}`, // 重定向到绝对路径出界
-    "echo x > ../escape.txt", // 重定向到父目录
-    "printf y >> ~/escape.txt", // 重定向到家目录
-    "cp a.txt /etc/b.txt", // 写命令 + 出界绝对路径
-  ];
-  for (const c of deny) assert.equal(detectWriteEscape(c, WD)?.kind, "deny", `应硬拦：${c}`);
-});
-
-test("写边界守卫：cd 出 workdir + 写信号但无确切出界目标 → review（交语义守卫，不再硬拦）", () => {
-  // 重定向目标是相对路径（regex 相对 WD 解析落界内、①不拦），cd 后真实 cwd 已出界 → 拿不准 → 交裁决。
-  const review = [
-    "cd .. && echo x > stolen.txt",
+    // 以下曾走正则写边界/review 语义守卫——写边界已交给沙箱内核，闸门只拦灾难命令
+    "echo x > /etc/evil.txt", // 越界写：不再是闸门职责（沙箱会 EPERM），闸门放行交确认/沙箱
     "cd /tmp && echo x > out.txt",
   ];
-  for (const c of review) assert.equal(detectWriteEscape(c, WD)?.kind, "review", `应交裁决：${c}`);
-});
-
-test("写边界守卫：workdir 内的写不误拦", () => {
-  const ok = [
-    "echo x > out.txt",
-    "echo x > sub/dir/out.txt",
-    "cp a.txt sub/b.txt",
-    "node script.js 2>&1", // fd 重定向不是文件
-    "foo 2>/dev/null", // 空洞
-    "cat /etc/hosts", // 读绝对路径、无写动作 → 放行
-    "npm test",
-  ];
-  for (const c of ok) assert.equal(detectWriteEscape(c, WD), null, `不应拦：${c}`);
-});
-
-test("写边界守卫：cd 进 workdir 子目录 + 代码含 > 比较符 → 不误判（修复旧 FP）", () => {
-  // 旧实现：cd 到绝对路径 = 逃逸 + 代码里的 `>` = 重定向 → 误判越界写。
-  // 这正是 /converge 的 Convergent 跑只读分析被反复误拦、空烧轮数的根因。
-  const sub = `${WD}/test_project/feishu`;
-  const ok = [
-    `cd ${sub} && python -c "print(len(x) > 0)"`, // cd 进子目录 + 代码比较符
-    `cd ${sub}; python -c "for f in items: print(f'{f} -> {t}')"`, // 格式串里的 ->
-    `cd ${sub} && python deep_trace.py 2>&1`, // cd 子目录跑只读脚本
-    `cd ${sub} && cat data.json`, // cd 子目录读文件
-  ];
-  for (const c of ok) assert.equal(detectWriteEscape(c, WD), null, `不应拦：${c}`);
-});
-
-test("写边界守卫：deny 即便 autoApprove（这是边界，不是确认项）", () => {
-  const p = new PermissionPolicy({ autoApprove: true, workdir: WD });
-  assert.equal(p.check("bash", { cmd: `echo x > ${OUT_ABS}` }).verdict, "deny");
-  assert.equal(p.check("bash", { cmd: "echo x > out.txt" }).verdict, "allow"); // 界内放行
-});
-
-test("写边界守卫：不传 workdir → 守卫关闭（向后兼容）；allowWriteOutside → 放开", () => {
-  assert.equal(new PermissionPolicy({ autoApprove: true }).check("bash", { cmd: `echo x > ${OUT_ABS}` }).verdict, "allow");
-  assert.equal(
-    new PermissionPolicy({ autoApprove: true, workdir: WD, allowWriteOutside: true }).check("bash", { cmd: `echo x > ${OUT_ABS}` }).verdict,
-    "allow",
-  );
+  for (const c of benign) assert.notEqual(verdict(c, false), "deny", c);
 });

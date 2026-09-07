@@ -90,3 +90,40 @@ test("未知字段被忽略（前向兼容）", () => {
   assert.equal((c as Record<string, unknown>).futureFlag, undefined);
   assert.equal(c.defaultModel, "a/b");
 });
+
+// ── sandbox 段（B 阶段重构后的形状校验）──────────────────────────────────
+import { defaultReadDeny, defaultWritePaths } from "../src/sandbox/policy.js";
+import { homedir } from "node:os";
+
+test("sandbox：readDeny / excluded 字段校验", () => {
+  const c = validateConfigFile({
+    sandbox: {
+      enabled: false,
+      network: false,
+      writePaths: ["/data"],
+      readDeny: ["~/.ssh"],
+      excluded: ["brew", "swift"],
+      memMax: "4G",
+      pidsMax: 128,
+    },
+  });
+  assert.deepEqual(c.sandbox, {
+    enabled: false,
+    network: false,
+    writePaths: ["/data"],
+    readDeny: ["~/.ssh"],
+    excluded: ["brew", "swift"],
+    memMax: "4G",
+    pidsMax: 128,
+  });
+  assert.throws(() => validateConfigFile({ sandbox: { readDeny: "x" } }), /sandbox\.readDeny 应为字符串数组/);
+  assert.throws(() => validateConfigFile({ sandbox: { excluded: [1] } }), /sandbox\.excluded 应为字符串数组/);
+  assert.throws(() => validateConfigFile({ sandbox: [1] }), /sandbox 应为对象/);
+});
+
+test("sandbox 默认策略：writePaths 不含 ~/.config；readDeny 默认盖 ~/.ssh/.aws/.gnupg", () => {
+  const home = homedir();
+  const writePaths = defaultWritePaths(home);
+  assert.ok(!writePaths.includes(`${home}/.config`), "旧默认的 ~/.config 已收紧（显式配置才可写）");
+  assert.deepEqual(defaultReadDeny(home), [`${home}/.ssh`, `${home}/.aws`, `${home}/.gnupg`]);
+});

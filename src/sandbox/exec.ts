@@ -1,30 +1,73 @@
 import { spawn } from "node:child_process";
-import { buildSandboxedCommand, resolveRwPaths, detectSandboxCaps, type SandboxPolicy } from "./bwrap.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { buildSandboxedCommand, resolveReadDeny, resolveRwPaths, detectSandboxCaps, type SandboxCaps } from "./bwrap.js";
+import { buildSeatbeltCommand, resolveSeatbeltPaths, seatbeltAvailable } from "./seatbelt.js";
+import { whitelistEnv } from "./policy-env.js";
+import { isExcluded, headToken, type SandboxPolicy } from "./policy.js";
 
 /**
- * 沙箱执行层 —— 工具（目前是 bash）在受限子进程里跑：
- *   · 擦除密钥的环境变量（防 `echo $XXX_API_KEY` 泄漏 / prompt 注入偷 key）
- *   · 关闭 stdin（不完整命令不再阻塞读 stdin 卡死）
+ * 沙箱执行层 —— 工具（bash/diagnostics）在受限子进程里跑：
+ *   · 平台策略路由：Linux → bwrap(+cgroup)；macOS → sandbox-exec(Seatbelt)；无后端 → 大声降级
+ *   · 统一白名单环境（policy-env.ts，三端同源）——子进程拿不到任何密钥类变量
+ *   · 关闭 stdin（不完整命令不再阻塞卡死）
  *   · 超时杀**整棵进程树**（POSIX 进程组）
  *   · 输出字节上限，超出即截断并终止
  *
- * 诚实边界（纯 Node + 无容器）：限不了 CPU/内存、拦不了网络、挡不住命令往任意
- * 绝对路径写。这不是对抗恶意代码的安全边界——那需要容器/VM。这里只做到
- * 「隔离 + 防密钥泄漏 + 健壮」。
+ * 降级是**大声**的：initSandbox 探测后端，无后端时状态可查（getSandboxStatus），
+ * 启动横幅 / TUI 仪表盘都会显示「未沙箱」——旧版静默 no-op 的问题不再。
+ * 豁免命令（policy.excluded，如 brew——沙箱内不可嵌套沙箱）：不沙箱执行，但输出前置警告。
  */
+export type SandboxBackend = "bwrap" | "seatbelt" | "none";
 
-/** 变量名匹配到即从子进程环境剔除（密钥 / 令牌 / 口令类）。 */
-const SECRET_NAME_RE = /(_KEY$|API_?KEY|_TOKEN|TOKEN$|_SECRET|SECRET$|PASSWORD|PASSWD|CREDENTIAL|ACCESS_KEY|_PAT$|BEARER)/i;
+export interface SandboxStatus {
+  backend: SandboxBackend;
+  /** 人类可读的原因（降级时说明为什么）。 */
+  reason: string;
+  /** 策略是否开启（false = 用户显式关闭）。 */
+  enabled: boolean;
+}
 
-/** 复制一份环境，删掉任何像密钥的变量（保留 PATH / SystemRoot / TEMP 等命令所需）。 */
-export function scrubbedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(base)) {
-    if (v === undefined) continue;
-    if (SECRET_NAME_RE.test(k)) continue;
-    out[k] = v;
+/** 进程级默认沙箱策略（forge-agent 启动时 setSandboxPolicy(config.sandbox) 注入一次）。 */
+let activePolicy: SandboxPolicy | null = null;
+let activeStatus: SandboxStatus = { backend: "none", reason: "尚未初始化", enabled: false };
+let sessionTmp: string | null = null;
+
+/** 设置默认沙箱策略并探测后端（大声降级的落点）。传 null 关闭。单测可给 execSandboxed 传 opts.policy 覆盖。 */
+export function setSandboxPolicy(p: SandboxPolicy | null): void {
+  activePolicy = p;
+  activeStatus = p ? pickBackend(p, detectSandboxCaps()) : { backend: "none", reason: "策略未配置", enabled: false };
+  // 会话级私有临时目录（macOS 侧替代 bwrap 的 --tmpfs /tmp：seatbelt 只能限制共享目录，
+  // 给每会话独立 $TMPDIR 才有「私有 /tmp」语义）
+  if (sessionTmp) {
+    try {
+      rmSync(sessionTmp, { recursive: true, force: true });
+    } catch {
+      /* 清不掉就算了 */
+    }
   }
-  return out;
+  sessionTmp = p?.enabled && activeStatus.backend === "seatbelt" ? mkdtempSync(`${tmpdir()}/forge-sandbox-`) : null;
+}
+
+/** 当前沙箱状态（启动横幅 / TUI 仪表盘用）。 */
+export function getSandboxStatus(): SandboxStatus {
+  return activeStatus;
+}
+
+/** 纯函数：按平台 + 能力探测选后端。 */
+export function pickBackend(policy: SandboxPolicy, caps: SandboxCaps & { seatbelt?: boolean } = detectSandboxCaps()): SandboxStatus {
+  if (!policy.enabled) return { backend: "none", reason: "FORGE_SANDBOX=0 用户关闭", enabled: false };
+  if (process.platform === "linux" && caps.bwrap) {
+    return { backend: "bwrap", reason: caps.systemdRun ? "bwrap + systemd cgroup" : "bwrap（无 systemd：仅隔离，不限内存）", enabled: true };
+  }
+  if (process.platform === "darwin" && (caps.seatbelt ?? seatbeltAvailable())) {
+    return { backend: "seatbelt", reason: "sandbox-exec (Seatbelt)；macOS 无内存限额", enabled: true };
+  }
+  return {
+    backend: "none",
+    reason: process.platform === "linux" ? "未安装 bwrap（brew/apt 装 bubblewrap 后自动启用）" : "该平台无硬沙箱后端",
+    enabled: true,
+  };
 }
 
 export interface SandboxExecOptions {
@@ -48,11 +91,39 @@ export interface SandboxExecResult {
   ms: number;
 }
 
-/** 进程级默认沙箱策略（forge-agent 启动时 setSandboxPolicy(config.sandbox) 注入一次）。 */
-let activePolicy: SandboxPolicy | null = null;
-/** 设置默认沙箱策略；传 null 关闭。单测可改给 execSandboxed 传 opts.policy 覆盖。 */
-export function setSandboxPolicy(p: SandboxPolicy | null): void {
-  activePolicy = p;
+/** 在受限子进程里执行一条命令（Linux 叠 bwrap+cgroup；macOS 叠 sandbox-exec；否则白名单 env + /bin/sh）。 */
+export function execSandboxed(cmd: string, opts: SandboxExecOptions): Promise<SandboxExecResult> {
+  const policy = opts.policy ?? activePolicy;
+  const env = whitelistEnv(); // ← 统一白名单：三端同源，子进程拿不到 API key
+
+  if (policy?.enabled) {
+    // 豁免名单：沙箱内不可嵌套沙箱（brew / swift test 等自带沙箱的工具）——不沙箱执行 + 大声警告。
+    if (isExcluded(cmd, policy)) {
+      return spawnCaptured("/bin/sh", ["-c", cmd], { ...opts, env }).then((r) => ({
+        ...r,
+        out: `[sandbox] 命令 "${headToken(cmd)}" 在豁免名单（沙箱内无法运行自带沙箱的工具），本次未沙箱执行。\n${r.out}`,
+      }));
+    }
+    const status = pickBackend(policy);
+    if (status.backend === "seatbelt" && sessionTmp) {
+      const { rwPaths, readDeny } = resolveSeatbeltPaths(opts.cwd, policy);
+      rwPaths.push(sessionTmp); // 每会话私有 $TMPDIR = 「私有 /tmp」语义
+      const { file, args } = buildSeatbeltCommand(cmd, policy, rwPaths, readDeny, { ...env, TMPDIR: sessionTmp });
+      return spawnCaptured(file, args, { ...opts, env });
+    }
+    if (status.backend === "bwrap") {
+      const rwPaths = resolveRwPaths(opts.cwd, policy);
+      const readDeny = resolveReadDeny(policy);
+      const { file, args } = buildSandboxedCommand(cmd, opts.cwd, policy, detectSandboxCaps(), rwPaths, readDeny, {
+        ...env,
+        TMPDIR: "/tmp", // bwrap 已给独立 tmpfs /tmp
+      });
+      return spawnCaptured(file, args, { ...opts, env });
+    }
+  }
+
+  // 无策略 / 无后端：白名单 env 的 /bin/sh（降级状态由 getSandboxStatus 暴露，启动时大声提示）
+  return spawnCaptured("/bin/sh", ["-c", cmd], { ...opts, env });
 }
 
 /**
@@ -63,30 +134,12 @@ export function signalOf(context: { abortSignal?: AbortSignal | undefined } | un
   return context?.abortSignal;
 }
 
-/** 在受限子进程里执行一条命令（shell-string，经 /bin/sh；Linux 上再叠 bwrap 硬沙箱）。 */
-export function execSandboxed(cmd: string, opts: SandboxExecOptions): Promise<SandboxExecResult> {
-  const spawnOpts = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes, env: scrubbedEnv(), signal: opts.signal };
-
-  // Linux 硬沙箱：策略开启 + 装了 bwrap → bwrap(+cgroup) 包一层；否则优雅降级到原行为。
-  const policy = opts.policy ?? activePolicy;
-  if (policy?.enabled) {
-    const caps = detectSandboxCaps();
-    if (caps.bwrap) {
-      const rwPaths = resolveRwPaths(opts.cwd, policy);
-      const { file, args } = buildSandboxedCommand(cmd, opts.cwd, policy, caps, rwPaths, process.env);
-      return spawnCaptured(file, args, spawnOpts);
-    }
-  }
-
-  return spawnCaptured("/bin/sh", ["-c", cmd], spawnOpts);
-}
-
 export interface SpawnCapturedOptions {
   cwd?: string;
   timeoutMs?: number;
   /** 输出字节上限，默认 1 MiB。 */
   maxBytes?: number;
-  /** 子进程环境；默认 scrubbedEnv()（剔密钥）。 */
+  /** 子进程环境；默认 whitelistEnv()。 */
   env?: NodeJS.ProcessEnv;
   /** Ctrl+C → harness 透传的中止信号；触发即 kill 整棵进程树并立刻返回。 */
   signal?: AbortSignal;
@@ -111,7 +164,7 @@ export function spawnCaptured(file: string, args: string[], opts: SpawnCapturedO
 
     const child = spawn(file, args, {
       cwd: opts.cwd,
-      env: opts.env ?? scrubbedEnv(), // ← 关键：子进程拿不到 API key
+      env: opts.env ?? whitelistEnv(), // ← 统一白名单：子进程拿不到 API key
       stdio: ["ignore", "pipe", "pipe"], // ← 关键：stdin 直接 EOF，命令读不到输入也不会阻塞
       detached: true, // 自成进程组，便于整组杀
     });

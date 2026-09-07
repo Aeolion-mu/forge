@@ -3,10 +3,9 @@ import assert from "node:assert/strict";
 import {
   buildBwrapArgs,
   buildSandboxedCommand,
-  memToKiB,
-  type SandboxPolicy,
   type SandboxCaps,
 } from "../src/sandbox/bwrap.js";
+import type { SandboxPolicy } from "../src/sandbox/policy.js";
 
 const env = {
   PATH: "/usr/bin:/bin",
@@ -15,8 +14,10 @@ const env = {
   FOO_TOKEN: "t",
 } as NodeJS.ProcessEnv;
 
+const noDeny: string[] = [];
+
 test("buildBwrapArgs：只读根 + 可写口 + env 白名单 + chdir，密钥绝不进沙箱", () => {
-  const a = buildBwrapArgs("/work", true, ["/work", "/home/u/.cache"], env);
+  const a = buildBwrapArgs("/work", true, ["/work", "/home/u/.cache"], noDeny, env);
   const s = a.join(" ");
   assert.match(s, /--ro-bind \/ \//); // 只读根
   assert.match(s, /--bind \/work \/work/);
@@ -32,21 +33,28 @@ test("buildBwrapArgs：只读根 + 可写口 + env 白名单 + chdir，密钥绝
 });
 
 test("buildBwrapArgs：network 开关控制 --unshare-net（D1）", () => {
-  assert.ok(!buildBwrapArgs("/work", true, ["/work"], env).includes("--unshare-net"), "联网时不应断网");
-  assert.ok(buildBwrapArgs("/work", false, ["/work"], env).includes("--unshare-net"), "断网时应 --unshare-net");
+  assert.ok(!buildBwrapArgs("/work", true, ["/work"], noDeny, env).includes("--unshare-net"), "联网时不应断网");
+  assert.ok(buildBwrapArgs("/work", false, ["/work"], noDeny, env).includes("--unshare-net"), "断网时应 --unshare-net");
 });
 
 test("buildBwrapArgs：/tmp 不重复 bind（已由 --tmpfs 提供）", () => {
-  const a = buildBwrapArgs("/work", true, ["/work", "/tmp"], env);
+  const a = buildBwrapArgs("/work", true, ["/work", "/tmp"], noDeny, env);
   assert.ok(a.includes("--tmpfs"));
   assert.ok(!a.join(" ").includes("--bind /tmp /tmp"));
 });
 
-const policy: SandboxPolicy = { enabled: true, network: true, writePaths: ["/tmp"], memMax: "2G", pidsMax: 512 };
+test("buildBwrapArgs：readDeny 用空 tmpfs 盖住敏感目录（读隐藏）", () => {
+  const a = buildBwrapArgs("/work", true, ["/work"], ["/home/u/.ssh", "/home/u/.aws"], env);
+  const s = a.join(" ");
+  assert.match(s, /--tmpfs \/home\/u\/\.ssh/);
+  assert.match(s, /--tmpfs \/home\/u\/\.aws/);
+});
 
-test("buildSandboxedCommand：有 systemd → 外层 systemd-run 套 cgroup（D3 优先）", () => {
+const policy: SandboxPolicy = { enabled: true, network: true, writePaths: ["/tmp"], readDeny: [], memMax: "2G", pidsMax: 512, excluded: [] };
+
+test("buildSandboxedCommand：有 systemd → 外层 systemd-run 套 cgroup（唯一内存限额路）", () => {
   const caps: SandboxCaps = { bwrap: true, systemdRun: true };
-  const { file, args } = buildSandboxedCommand("echo hi", "/work", policy, caps, ["/work"], env);
+  const { file, args } = buildSandboxedCommand("echo hi", "/work", policy, caps, ["/work"], [], env);
   assert.equal(file, "systemd-run");
   const s = args.join(" ");
   assert.match(s, /--user --scope/);
@@ -57,29 +65,22 @@ test("buildSandboxedCommand：有 systemd → 外层 systemd-run 套 cgroup（D3
   assert.equal(args.slice(-3).join(" "), "/bin/sh -c echo hi");
 });
 
-test("buildSandboxedCommand：无 systemd → rlimits 回退（D3 fallback）", () => {
+test("buildSandboxedCommand：无 systemd → 纯隔离 + ulimit -u（**没有 ulimit -v**——它会弄死 V8）", () => {
   const caps: SandboxCaps = { bwrap: true, systemdRun: false };
-  const { file, args } = buildSandboxedCommand("make", "/work", policy, caps, ["/work"], env);
+  const { file, args } = buildSandboxedCommand("make", "/work", policy, caps, ["/work"], [], env);
   assert.equal(file, "bwrap");
+  const s = args.join(" ");
   const inner = args[args.length - 1]!;
-  assert.match(inner, /ulimit -v 2097152/); // 2G → KiB
   assert.match(inner, /ulimit -u 512/);
   assert.match(inner, /make$/);
+  assert.ok(!s.includes("ulimit -v"), "ulimit -v 限制 V8 地址空间会把 node/npx 弄成 ENOMEM，已删");
 });
 
 test("buildSandboxedCommand：不限额分支干净（无 ulimit、无 systemd-run）", () => {
   const caps: SandboxCaps = { bwrap: true, systemdRun: false };
   const noLimit: SandboxPolicy = { ...policy, memMax: "", pidsMax: 0 };
-  const { file, args } = buildSandboxedCommand("ls", "/work", noLimit, caps, ["/work"], env);
+  const { file, args } = buildSandboxedCommand("ls", "/work", noLimit, caps, ["/work"], [], env);
   assert.equal(file, "bwrap");
   assert.equal(args.slice(-3).join(" "), "/bin/sh -c ls");
   assert.ok(!args.join(" ").includes("ulimit"));
-});
-
-test("memToKiB：单位解析", () => {
-  assert.equal(memToKiB("2G"), 2 * 1024 * 1024);
-  assert.equal(memToKiB("512M"), 512 * 1024);
-  assert.equal(memToKiB("1024K"), 1024);
-  assert.equal(memToKiB("  256M "), 256 * 1024);
-  assert.equal(memToKiB("abc"), null);
 });
