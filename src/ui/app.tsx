@@ -18,7 +18,7 @@ import { wrapVisible, visibleWidth } from "./markdown.js";
 import { MultilineInput } from "./multiline-input.js";
 import { normalizeRange, lineRangeInSel, highlightRange, plainOf, expandWord, wholeLine, selectedText } from "./selection.js";
 import { copyText } from "./clipboard.js";
-import { replayBlocks, firstUserPreview } from "./session-replay.js";
+import { replayBlocks, firstUserPreviewSync } from "./session-replay.js";
 import type { JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
 
 // 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
@@ -93,8 +93,7 @@ export function App({
   resumedFrom?: JsonlSessionMetadata;
 }) {
   const { exit } = useApp();
-  const { columns: termCols, rows: termRows } = useWindowSize();
-  const [blocks, setBlocks] = useState<Block[]>([]);
+  const { columns: termCols, rows: termRows } = useWindowSize();  const [blocks, setBlocks] = useState<Block[]>([]);
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState("");
   const [confirm, setConfirm] = useState<ConfirmReq | null>(null);
@@ -585,11 +584,13 @@ export function App({
         const sessions = all
           .filter((x) => x.id !== agent.sessionId)
           .sort((a, b) => b.modifiedAt - a.modifiedAt)
+          .slice(0, 15);
+        // 过滤空壳会话（崩溃/强杀残留：只有 header 没有用户消息）
+        const items = sessions
+          .map((m) => ({ key: m.id, label: `${relTime(m.modifiedAt)} · ${firstUserPreviewSync(m.path)}`, meta: m }))
+          .filter((x) => x.label.includes("· ") && !x.label.endsWith("· "))
           .slice(0, 10);
-        if (!sessions.length) return push(ansi.dim("没有可恢复的历史会话"));
-        const items = await Promise.all(
-          sessions.map(async (m) => ({ key: m.id, label: `${relTime(m.modifiedAt)} · ${await firstUserPreview(m.path)}`, meta: m })),
-        );
+        if (!items.length) return push(ansi.dim("没有可恢复的历史会话"));
         setPicker({ kind: "resume", items, sel: 0 });
       },
       "/rewind": async () => {

@@ -1,5 +1,6 @@
 import type { Entry } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
+import { readFileSync } from "node:fs";
 import { defaultCollapsed, type NewBlock } from "./blocks.js";
 import { ansi } from "./theme.js";
 
@@ -96,26 +97,27 @@ function summarizeArgs(name: string, args: unknown): string {
   }
 }
 
-/** 读会话 JSONL 取首条用户消息做 /resume 列表预览（容错：任何解析失败返回占位）。 */
-export async function firstUserPreview(path: string): Promise<string> {
-  const { readFileSync } = await import("node:fs");
+/** 读会话 JSONL 取首条用户消息做 /resume 列表预览；空串 = 无用户消息（空壳会话，调用方过滤）。 */
+export function firstUserPreviewSync(path: string): string {
   try {
     for (const line of readFileSync(path, "utf8").split("\n")) {
       if (!line.trim()) continue;
       try {
-        const j = JSON.parse(line) as Record<string, unknown>;
-        const msg = (j.message ?? (j as { message?: unknown }).message) as
-          | { role?: string; content?: unknown }
-          | undefined;
-        if (msg?.role === "user") {
-          const c = msg.content;
-          const t = typeof c === "string"
-            ? c
-            : Array.isArray(c)
-              ? (c as Array<{ type: string; text?: string }>).filter((x) => x.type === "text").map((x) => x.text ?? "").join("")
-              : "";
-          const clean = t.replace(/\s+/g, " ").trim();
-          if (clean) return clean.slice(0, 50);
+        const j = JSON.parse(line);
+        // v4 存储行：header 对象 / commit 数组 [{entry}, {value-op}, …]——消息在数组元素里
+        const candidates: unknown[] = Array.isArray(j) ? j : [j];
+        for (const el of candidates) {
+          const msg = (el as { kind?: string; message?: { role?: string; content?: unknown } }).message;
+          if (msg?.role === "user") {
+            const c = msg.content;
+            const t = typeof c === "string"
+              ? c
+              : Array.isArray(c)
+                ? (c as Array<{ type: string; text?: string }>).filter((x) => x.type === "text").map((x) => x.text ?? "").join("")
+                : "";
+            const clean = t.replace(/\s+/g, " ").trim();
+            if (clean) return clean.slice(0, 50);
+          }
         }
       } catch {
         /* 跳过坏行 */
@@ -124,5 +126,10 @@ export async function firstUserPreview(path: string): Promise<string> {
   } catch {
     /* 读不了就算了 */
   }
-  return "(空会话)";
+  return "";
+}
+
+/** async 包装（保持既有签名）。 */
+export async function firstUserPreview(path: string): Promise<string> {
+  return firstUserPreviewSync(path);
 }

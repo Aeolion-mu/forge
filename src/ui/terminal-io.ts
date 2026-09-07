@@ -176,7 +176,9 @@ export function createMouseStdin(real: Readable): MouseStdin {
     for (const piece of splitControls(passthrough)) {
       queue.push(piece);
     }
-    if (passthrough) proxy.emit("readable");
+    if (passthrough) {
+      proxy.emit("readable");
+    }
   };
   real.on("data", onData);
   real.resume();
@@ -196,7 +198,7 @@ export function createMouseStdin(real: Readable): MouseStdin {
     return () => bus.off("mouse", listener);
   };
   const realAny = real as unknown as Record<string, unknown>;
-  for (const method of ["setRawMode", "setEncoding", "ref", "unref", "pause", "destroy"]) {
+  for (const method of ["setRawMode", "setEncoding", "ref", "unref", "pause", "resume", "destroy"]) { // resume 必须转发：Ink pause 后 resume 落空会让 real.stdin 永久暂停（输入链路整条死）
     if (typeof realAny[method] === "function") {
       anyProxy[method] = (...args: unknown[]) => (realAny[method] as (...a: unknown[]) => unknown)(...args);
     }

@@ -77,7 +77,6 @@ async function main(): Promise<void> {
   // 2) 交互式 REPL：全屏 TUI（备用屏 + 虚拟视口 + 鼠标，Claude Code 式）。
   // 循环支持 /resume 热切换：App exit + requestResume(meta) → 本循环用 resume 重建 agent+App。
   const io = new TerminalIo(stdout);
-  const mouseStdin = createMouseStdin(process.stdin);
   let resumeMeta: JsonlSessionMetadata | undefined = undefined;
   // --resume <id> / FORGE_RESUME=<id> 直启（id 前缀匹配）
   const resumeArg = (() => {
@@ -105,6 +104,10 @@ async function main(): Promise<void> {
         pendingResume = m;
       },
     };
+    // 每轮新建 stdin 代理：Ink 7 同一 stdout 上连续 render 属 unsupported
+    // （复用未完全卸载的实例 → 第二个 App 树挂不上 → 卡死），必须 waitUntilExit 后
+    // 显式 unmount 让 instances map 清理，且不复用上一轮的代理状态。
+    const mouseStdin = createMouseStdin(process.stdin);
     const agent = await ForgeAgent.create(config, {
       autoApprove,
       render: false, // 事件改由 Ink 消费，不写 stdout
@@ -123,6 +126,8 @@ async function main(): Promise<void> {
       exitOnCtrlC: false,
     });
     await app.waitUntilExit();
+    app.unmount(); // 关键：确保 Ink 实例从 stdout 注册表移除，否则下一轮 render 复用死实例卡死
+    (mouseStdin as unknown as { detach?: () => void }).detach?.(); // 解除本轮真实 stdin 监听
     io.restore(); // 出备用屏、关鼠标、恢复光标（下一轮循环会重新 enter）
     await agent.dispose();
     if (!pendingResume) {
@@ -131,7 +136,6 @@ async function main(): Promise<void> {
     }
     resumeMeta = pendingResume; // /resume 热切换：重建会话（挂载逐字重放）
   }
-  (mouseStdin as unknown as { detach?: () => void }).detach?.(); // 解除真实 stdin 监听，放行进程退出
 }
 
 main().catch((err) => {
