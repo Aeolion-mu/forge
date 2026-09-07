@@ -18,16 +18,27 @@ import { wrapVisible, visibleWidth } from "./markdown.js";
 import { MultilineInput } from "./multiline-input.js";
 import { normalizeRange, lineRangeInSel, highlightRange, plainOf, expandWord, wholeLine, selectedText } from "./selection.js";
 import { copyText } from "./clipboard.js";
+import { replayBlocks, firstUserPreview } from "./session-replay.js";
+import type { JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
 
 // 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
 const WRITE_VERB: Record<string, string> = { edit_file: "Update", write_file: "Write" };
-import type { ForgeAgent } from "../kernel/forge-agent.js";
+import { ForgeAgent } from "../kernel/forge-agent.js";
 import type { ForgeConfig } from "../config.js";
 
 /** 是否为中止类错误（Ctrl+C 触发，不当作错误提示）。 */
 function isAbortErr(e: unknown): boolean {
   const x = e as { name?: string; code?: string; message?: string } | null;
   return x?.name === "AbortError" || x?.code === "ABORT_ERR" || /abort/i.test(x?.message ?? "");
+}
+
+/** 相对时间（会话列表用）。 */
+function relTime(ts: number): string {
+  const d = Date.now() - ts;
+  if (d < 60_000) return "刚刚";
+  if (d < 3_600_000) return `${Math.floor(d / 60_000)} 分钟前`;
+  if (d < 86_400_000) return `${Math.floor(d / 3_600_000)} 小时前`;
+  return `${Math.floor(d / 86_400_000)} 天前`;
 }
 
 function human(n: number): string {
@@ -54,6 +65,8 @@ export interface AppBridge {
   resume: (text: string) => void;
   /** Convergent 验收 agent 的事件流：渲染成带 ⟢ 前缀的活动块。 */
   convergentEvent: (e: HarnessEvent) => void;
+  /** /resume 选中会话 → 通知 index 重启循环换会话（App 随即 exit）。 */
+  requestResume?: (meta: JsonlSessionMetadata) => void;
 }
 
 /**
@@ -70,11 +83,14 @@ export function App({
   config,
   bridge,
   mouseStdin,
+  resumedFrom,
 }: {
   agent: ForgeAgent;
   config: ForgeConfig;
   bridge: AppBridge;
   mouseStdin: MouseStdin;
+  /** 恢复来源会话（新会话为 undefined）——挂载时逐字重放其条目。 */
+  resumedFrom?: JsonlSessionMetadata;
 }) {
   const { exit } = useApp();
   const { columns: termCols, rows: termRows } = useWindowSize();
@@ -97,6 +113,14 @@ export function App({
   const [newCount, setNewCount] = useState(0);
   // 鼠标点击输入框 → 请求把光标移到该列（消费后置 null）。
   const [cursorCol, setCursorCol] = useState<number | null>(null);
+  // /resume · /rewind 的选择器（输入框上方浮层）：↑↓ 选择、Enter 确认、Esc 取消、点击行确认。
+  const [picker, setPicker] = useState<{
+    kind: "resume" | "rewind";
+    items: Array<{ key: string; label: string; meta?: JsonlSessionMetadata; turn?: { parentTip: string | null; text: string } }>;
+    sel: number;
+  } | null>(null);
+  const pickerRef = useRef(picker);
+  pickerRef.current = picker;
   // 右下角浮动 toast（复制提示等）：单条、右对齐、自动消失、不进会话记录；新提示替换旧的。
   const [toast, setToast] = useState<string | null>(null);
   useEffect(() => {
@@ -182,6 +206,12 @@ export function App({
     }
     lines.push("");
     pushBlock({ kind: "banner", lines });
+    // 恢复会话：逐字重放全部条目（新会话为空数组，零成本）
+    void (async () => {
+      const entries = await agent.conversationEntries();
+      for (const b of replayBlocks(entries)) pushBlock(b);
+      if (resumedFrom) pushBlock({ kind: "plain", text: ansi.dim(`⏵ 已恢复会话 ${resumedFrom.id.slice(0, 8)}（${entries.length} 条消息）——继续对话即可`) });
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -441,6 +471,52 @@ export function App({
     { isActive: menuOpen && confirm === null },
   );
 
+  // 选择器键盘：↑↓ 选择、Enter 确认、Esc 取消（打开期间 MultilineInput 整体失活）
+  const confirmPicker = useCallback(async () => {
+    const pk = pickerRef.current;
+    if (!pk) return;
+    const item = pk.items[pk.sel]!;
+    setPicker(null);
+    if (pk.kind === "resume") {
+      if (item.meta && bridge.requestResume) {
+        bridge.requestResume(item.meta);
+        exit(); // index 循环重建 agent + App（挂载重放选中会话）
+      }
+      return;
+    }
+    // rewind：回退 → 重建 transcript → 原文放回输入框
+    try {
+      await agent.rewindTo(item.turn!.parentTip);
+      const entries = await agent.conversationEntries();
+      const banner = blocksRef.current[0]; // banner block 保留
+      idRef.current = 1;
+      const replayed = replayBlocks(entries).map((b) => ({ ...b, id: idRef.current++ }) as Block);
+      setBlocks(banner ? [banner, ...replayed] : replayed);
+      setInput(item.turn!.text);
+      histIdxRef.current = null;
+      setToast("⏪ 已回退，消息已放回输入框（编辑后重发）");
+      setScrollOffset(0);
+      setNewCount(0);
+    } catch (err) {
+      push(ansi.error(`rewind 失败：${(err as Error).message}`));
+    }
+  }, [agent, bridge, exit, push]);
+
+  useInput(
+    (_ch, key) => {
+      const pk = pickerRef.current;
+      if (!pk) return;
+      if (key.escape) return setPicker(null);
+      if (key.upArrow || key.downArrow) {
+        const next = key.upArrow ? pk.sel - 1 : pk.sel + 1;
+        setPicker({ ...pk, sel: (next + pk.items.length) % pk.items.length });
+        return;
+      }
+      if (key.return) void confirmPicker();
+    },
+    { isActive: picker !== null },
+  );
+
   // 视口滚动键：PgUp/PgDn 半屏，Shift+↑/↓ 单行，Ctrl+End 跳底恢复跟随
   useInput(
     (_ch, key) => {
@@ -502,6 +578,29 @@ export function App({
       "/skills": () => {
         const sk = agent.listSkills();
         push(sk.length ? sk.map((s) => `  · \x1b[1m${s.name}\x1b[0m ${s.description}`).join("\n") : ansi.dim("(no skills loaded)"));
+      },
+      "/resume": async () => {
+        if (busy || working !== null) return push(ansi.dim("运行中不可 /resume（先 Ctrl+C 中止）"));
+        const all = await ForgeAgent.listSessions(config);
+        const sessions = all
+          .filter((x) => x.id !== agent.sessionId)
+          .sort((a, b) => b.modifiedAt - a.modifiedAt)
+          .slice(0, 10);
+        if (!sessions.length) return push(ansi.dim("没有可恢复的历史会话"));
+        const items = await Promise.all(
+          sessions.map(async (m) => ({ key: m.id, label: `${relTime(m.modifiedAt)} · ${await firstUserPreview(m.path)}`, meta: m })),
+        );
+        setPicker({ kind: "resume", items, sel: 0 });
+      },
+      "/rewind": async () => {
+        if (busy || working !== null) return push(ansi.dim("运行中不可 /rewind（先 Ctrl+C 中止）"));
+        const turns = await agent.userTurns();
+        if (!turns.length) return push(ansi.dim("没有可回退的用户消息"));
+        setPicker({
+          kind: "rewind",
+          items: turns.map((t) => ({ key: t.entryId, label: `#${t.index + 1} ${t.text.replace(/\s+/g, " ").slice(0, 50)}`, turn: { parentTip: t.parentTip, text: t.text } })),
+          sel: 0,
+        });
       },
       "/mouse": () => {
         const next = !mouseOn;
@@ -580,6 +679,7 @@ export function App({
       : [];
   const jumpLine = scrollOffset > 0 ? 1 : 0;
   const menuLines = menuOpen && !confirm ? menuMatches.length + 1 : 0;
+  const pickerLines = picker ? picker.items.length + 1 : 0;
   const subDashLines = agent.subTelemetry.turns > 0 ? 1 : 0;
   const subStatusLines = subStatus ? 1 : 0;
   const toastLine = toast ? 1 : 0;
@@ -590,6 +690,7 @@ export function App({
     (busy ? 1 : 0) +
     (working ? 1 : 0) +
     menuLines +
+    pickerLines +
     3 + // 输入框：上下边框 + 内容行
     1 + // 仪表盘
     subDashLines +
@@ -618,15 +719,16 @@ export function App({
   viewportHeightRef.current = viewportHeight;
 
   // 可见行 → blockId 映射 + chrome 各可点区行号（屏幕 1-based 行）——每次渲染后更新供鼠标命中
-  const zonesRef = useRef<{ viewportRows: number; jumpRow: number | null; menuTop: number | null; inputRow: number | null }>({
+  const zonesRef = useRef<{ viewportRows: number; jumpRow: number | null; menuTop: number | null; pickerTop: number | null; inputRow: number | null }>({
     viewportRows: 0,
     jumpRow: null,
     menuTop: null,
+    pickerTop: null,
     inputRow: null,
   });
   zonesRef.current = (() => {
     let row = viewportHeight; // 视口占 1..viewportHeight
-    const z = { viewportRows: viewportHeight, jumpRow: null as number | null, menuTop: null as number | null, inputRow: null as number | null };
+    const z = { viewportRows: viewportHeight, jumpRow: null as number | null, menuTop: null as number | null, pickerTop: null as number | null, inputRow: null as number | null };
     row += toastLine;
     row += jumpLine;
     if (jumpLine) z.jumpRow = row;
@@ -636,6 +738,10 @@ export function App({
     if (menuLines) {
       z.menuTop = row + 1; // 菜单第一项（1-based）
       row += menuLines;
+    }
+    if (pickerLines) {
+      z.pickerTop = row + 1;
+      row += pickerLines;
     }
     row += 1; // 输入框上边框
     z.inputRow = row + 1;
@@ -744,6 +850,12 @@ export function App({
         }
         // 既有单击路由：Jump 按钮 / 菜单 / 输入框定位 / 工具折叠
         if (z.jumpRow === ev.row) return jumpToBottom();
+        if (z.pickerTop !== null && ev.row >= z.pickerTop && ev.row < z.pickerTop + (pickerRef.current?.items.length ?? 0)) {
+          const idx = ev.row - z.pickerTop;
+          if (pickerRef.current && idx === pickerRef.current.sel) void confirmPicker(); // 点选中项 = 确认
+          else setPicker({ ...pickerRef.current!, sel: idx });
+          return;
+        }
         if (z.menuTop !== null && ev.row >= z.menuTop && ev.row < z.menuTop + menuMatches.length) {
           setMenuIdx(ev.row - z.menuTop);
           return;
@@ -837,6 +949,17 @@ export function App({
         </Box>
       )}
 
+      {picker && (
+        <Box flexDirection="column">
+          {picker.items.map((it, i) => (
+            <Text key={it.key} color={i === picker.sel ? theme.prompt : theme.muted}>
+              {`${i === picker.sel ? "❯" : " "} ${it.label}`}
+            </Text>
+          ))}
+          <Text color={theme.muted}>{`  ↑↓ 选择 · Enter 确认 · Esc 取消（${picker.kind === "resume" ? "恢复该会话" : "回退到该消息"}）`}</Text>
+        </Box>
+      )}
+
       <Box borderStyle="single" borderColor={theme.muted} borderLeft={false} borderRight={false}>
         {confirm ? (
           <Text>
@@ -853,8 +976,8 @@ export function App({
               onSubmit={onSubmit}
               onHistoryPrev={historyPrev}
               onHistoryNext={historyNext}
-              menuOpen={menuOpen}
-              isActive={confirm === null}
+              menuOpen={menuOpen || picker !== null}
+              isActive={confirm === null && picker === null}
               cursorRequest={cursorCol}
               onCursorRequestHandled={() => setCursorCol(null)}
             />

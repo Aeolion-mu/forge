@@ -8,6 +8,7 @@ import { renderBanner, ansi } from "./ui/theme.js";
 import { explainApiError } from "./kernel/errors.js";
 import { getSandboxStatus } from "./sandbox/exec.js";
 import { TerminalIo, createMouseStdin } from "./ui/terminal-io.js";
+import type { JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
 
 /** Ctrl+C / EOF 触发的中断。 */
 function isAbort(e: unknown): boolean {
@@ -52,7 +53,10 @@ async function main(): Promise<void> {
   // 默认跳过写/执行确认（/pass-permissions 常开）：灾难命令仍有 HARD_DENY 硬拦、
   // 写边界在沙箱内核层，确认弹窗只剩打断价值。--confirm 可回到逐次确认模式。
   const autoApprove = !args.includes("--confirm");
-  const prompt = args.filter((a) => !a.startsWith("-")).join(" ").trim();
+  // --resume <id> 的 id 值不进 prompt（否则会被当一次性任务文本）
+  const resumeIdx = args.indexOf("--resume");
+  const promptSkip = new Set(resumeIdx >= 0 && args[resumeIdx + 1] ? [args[resumeIdx + 1]!] : []);
+  const prompt = args.filter((a, i) => !a.startsWith("-") && i !== resumeIdx + 1 && !promptSkip.has(a)).join(" ").trim();
 
   // 1) 一次性任务：forge "把 README 里的 TODO 列出来"（非 TUI，沿用流式渲染器）
   if (prompt) {
@@ -70,33 +74,64 @@ async function main(): Promise<void> {
     return;
   }
 
-  // 2) 交互式 REPL：全屏 TUI（备用屏 + 虚拟视口 + 鼠标，Claude Code 式）
-  const bridge: AppBridge = { confirm: async () => true, notice: () => {}, status: () => {}, subagent: () => {}, resume: () => {}, convergentEvent: () => {} };
-  const agent = await ForgeAgent.create(config, {
-    autoApprove,
-    render: false, // 事件改由 Ink 消费，不写 stdout
-    confirm: (t, a) => bridge.confirm(t, a),
-    onNotice: (s) => bridge.notice(s),
-    onStatus: (s) => bridge.status(s),
-    onSubStatus: (s) => bridge.subagent(s),
-    onResume: (t) => bridge.resume(t),
-    onConvergentEvent: (e) => bridge.convergentEvent(e),
-  });
-  // 备用屏 + 鼠标上报；Ink 喂过滤后的 stdin（鼠标序列剥走，键盘/粘贴原样透传）
+  // 2) 交互式 REPL：全屏 TUI（备用屏 + 虚拟视口 + 鼠标，Claude Code 式）。
+  // 循环支持 /resume 热切换：App exit + requestResume(meta) → 本循环用 resume 重建 agent+App。
   const io = new TerminalIo(stdout);
   const mouseStdin = createMouseStdin(process.stdin);
-  io.enter({ mouse: process.env.FORGE_NO_MOUSE !== "1" }); // FORGE_NO_MOUSE=1：不开鼠标捕获，保留原生选择
-  // exitOnCtrlC:false → 由 App 自己接管 Ctrl+C（运行中=中止 / 有输入=清空 / 空输入按两次=退出）
-  // stdin 断言：Ink 类型要 ReadStream，运行时只用 on/setRawMode/isTTY——代理全部提供。
-  const app = render(createElement(App, { agent, config, bridge, mouseStdin }), {
-    stdin: mouseStdin as unknown as NodeJS.ReadStream,
-    exitOnCtrlC: false,
-  });
-  await app.waitUntilExit();
+  let resumeMeta: JsonlSessionMetadata | undefined = undefined;
+  // --resume <id> / FORGE_RESUME=<id> 直启（id 前缀匹配）
+  const resumeArg = (() => {
+    const i = args.indexOf("--resume");
+    if (i >= 0 && args[i + 1]) return args[i + 1]!;
+    return process.env.FORGE_RESUME;
+  })();
+  if (resumeArg) {
+    const all = await ForgeAgent.listSessions(config);
+    const hit = all.find((x) => x.id === resumeArg || x.id.startsWith(resumeArg));
+    if (hit) resumeMeta = hit;
+    else stdout.write(`\x1b[33m未找到会话 ${resumeArg}\x1b[0m\n`);
+  }
+
+  for (;;) {
+    let pendingResume: JsonlSessionMetadata | undefined;
+    const bridge: AppBridge = {
+      confirm: async () => true,
+      notice: () => {},
+      status: () => {},
+      subagent: () => {},
+      resume: () => {},
+      convergentEvent: () => {},
+      requestResume: (m) => {
+        pendingResume = m;
+      },
+    };
+    const agent = await ForgeAgent.create(config, {
+      autoApprove,
+      render: false, // 事件改由 Ink 消费，不写 stdout
+      resume: resumeMeta,
+      confirm: (t, a) => bridge.confirm(t, a),
+      onNotice: (s) => bridge.notice(s),
+      onStatus: (s) => bridge.status(s),
+      onSubStatus: (s) => bridge.subagent(s),
+      onResume: (t) => bridge.resume(t),
+      onConvergentEvent: (e) => bridge.convergentEvent(e),
+    });
+    io.enter({ mouse: process.env.FORGE_NO_MOUSE !== "1" }); // 幂等；FORGE_NO_MOUSE=1 不开鼠标捕获
+    // exitOnCtrlC:false → App 自己接管 Ctrl+C；stdin 断言：Ink 只要 on/setRawMode/isTTY
+    const app = render(createElement(App, { agent, config, bridge, mouseStdin, resumedFrom: resumeMeta }), {
+      stdin: mouseStdin as unknown as NodeJS.ReadStream,
+      exitOnCtrlC: false,
+    });
+    await app.waitUntilExit();
+    io.restore(); // 出备用屏、关鼠标、恢复光标（下一轮循环会重新 enter）
+    await agent.dispose();
+    if (!pendingResume) {
+      finish(agent, config); // 真退出：主屏打印摘要
+      break;
+    }
+    resumeMeta = pendingResume; // /resume 热切换：重建会话（挂载逐字重放）
+  }
   (mouseStdin as unknown as { detach?: () => void }).detach?.(); // 解除真实 stdin 监听，放行进程退出
-  io.restore(); // 出备用屏、关鼠标、恢复光标 → 摘要在主屏打印
-  finish(agent, config);
-  await agent.dispose(); // 关闭 LSP server 子进程
 }
 
 main().catch((err) => {

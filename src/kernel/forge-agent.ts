@@ -526,6 +526,41 @@ export class ForgeAgent {
     return self;
   }
 
+  // ── /resume · /rewind 支持 ────────────────────────────────────────────────
+
+  /** 当前活跃路径的全部会话条目（TUI 挂载重放 / rewind 重建共用）。 */
+  async conversationEntries(): Promise<Entry[]> {
+    return this.lane.findEntries(undefined, this.ctx);
+  }
+
+  /** 活跃路径上的真实用户消息（跳过 toolResult），倒序（最新在前），供 /rewind 选择器。
+   *  parentTip = 该条目的 parentId —— 回退目标（navigateTree(M.parentId) = 移除 M 及其后全部）。 */
+  async userTurns(): Promise<Array<{ entryId: string; parentTip: string | null; text: string; index: number }>> {
+    const entries = await this.conversationEntries();
+    const turns: Array<{ entryId: string; parentTip: string | null; text: string; index: number }> = [];
+    let i = 0;
+    for (const e of entries) {
+      if (e.type !== "message") continue;
+      const msg = e.message as Message;
+      if (msg.role !== "user") continue;
+      const c = msg.content as unknown;
+      const text = typeof c === "string" ? c : Array.isArray(c)
+        ? (c as Array<{ type: string; text?: string }>).filter((x) => x.type === "text").map((x) => x.text ?? "").join("")
+        : "";
+      turns.push({ entryId: e.id, parentTip: e.parentId, text, index: i++ });
+    }
+    return turns.reverse(); // 最新在前，↑ 选更早
+  }
+
+  /** 回退到 parentTip（成为新 tip；其后全部移入分支）。纯导航：不摘要、不调 LLM。 */
+  async rewindTo(parentTip: string | null): Promise<void> {
+    const r = await this.lane.navigateTree(parentTip, undefined, this.ctx);
+    if (!r.ok) {
+      const err = r.error as { _tag?: string; message?: string };
+      throw new Error(err.message ?? err._tag ?? "rewind failed");
+    }
+  }
+
   /** 列出当前 workdir 下的历史会话（供 /resume）。 */
   static async listSessions(config: ForgeConfig): Promise<JsonlSessionMetadata[]> {
     const env = new NodeExecutionEnv({ cwd: config.workdir });
@@ -976,6 +1011,11 @@ export class ForgeAgent {
     const win = this.effectiveWindow;
     if (win <= 0 || this.lastContextTokens <= 0.9 * win) return;
     await this.runCompaction();
+  }
+
+  /** 当前会话 id（/resume 排除自身用）。 */
+  get sessionId(): string {
+    return this.session.metadata.id;
   }
 
   /** 当前模型 ref（provider/model）。 */

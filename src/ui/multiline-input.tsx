@@ -42,8 +42,12 @@ export function MultilineInput({
   const cursorRef = useRef(value.length);
 
   // 外部改 value（非本组件编辑）→ 光标移到末尾
+  // render 期间同步镜像 valueRef（latest-ref 惯用法）。曾放 effect 里：提交路径
+  // apply("X")→onChange("X")→同 tick Enter→onSubmit→setInput("")，React 19 批处理
+  // 合并两次 setState 后 value prop 从未以 "X" 渲染，[value] dep 不触发、effect 不跑，
+  // valueRef 滞留旧文本 → 下次输入拼接到已提交的消息后面。
+  valueRef.current = value;
   useEffect(() => {
-    valueRef.current = value;
     if (value !== emittedRef.current) {
       emittedRef.current = value;
       moveCursor(value.length);
