@@ -1,17 +1,21 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Box, Text, Static, useApp, useInput, useStdout } from "ink";
-import { MultilineInput } from "./multiline-input.js";
+import { Box, Text, useApp, useInput, useWindowSize } from "ink";
 import type { HarnessEvent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { renderMarkdown, wrapVisible, contentWidth } from "./markdown.js";
+import { renderMarkdown } from "./markdown.js";
 import { summarizeToolArgs, readFileResultLine } from "./render.js";
-import { theme, ansi, sparkFrame, SPARK_REST } from "./theme.js";
+import { theme, ansi, sparkFrame, SPARK_REST, renderBanner } from "./theme.js";
 import { renderFileDiff, type FileDiff } from "./diff.js";
 import { matchCommands, menuShouldOpen, resolveSubmitted } from "./commands.js";
 import { createRunQueue } from "./run-queue.js";
 import { ctrlCAction } from "./keybinds.js";
 import { getSandboxStatus } from "../sandbox/exec.js";
 import { explainApiError } from "../kernel/errors.js";
+import { defaultCollapsed, flattenBlocks, type Block, type NewBlock, type ToolBody } from "./blocks.js";
+import { visible, scrollBy } from "./viewport.js";
+import type { MouseEvent, MouseStdin } from "./terminal-io.js";
+import { wrapVisible } from "./markdown.js";
+import { MultilineInput } from "./multiline-input.js";
 
 // 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
 const WRITE_VERB: Record<string, string> = { edit_file: "Update", write_file: "Write" };
@@ -30,10 +34,6 @@ function human(n: number): string {
   return String(n);
 }
 
-interface Block {
-  id: number;
-  body: string;
-}
 interface ConfirmReq {
   tool: string;
   args: unknown;
@@ -54,8 +54,28 @@ export interface AppBridge {
   convergentEvent: (e: HarnessEvent) => void;
 }
 
-export function App({ agent, config, bridge }: { agent: ForgeAgent; config: ForgeConfig; bridge: AppBridge }) {
+/**
+ * 全屏 TUI（Claude Code 式）：备用屏 + 虚拟视口 + 鼠标。
+ *
+ * 渲染模型：block 只存原始数据（blocks.ts），渲染时按当前宽度展开成行（记忆化），
+ * 视口只画可见切片 → 树高恒 ≤ 终端行数，Ink 逐帧替换即全屏。resize 时 useWindowSize
+ * 触发全部 block 按新宽度重排（旧追加式 TUI 的「宽度冻死 + 擦除错位」问题根治）。
+ * 鼠标：滚轮滚动（上滚暂停自动跟随 + 底部 Jump 按钮计数新消息）、点击折叠的工具结果
+ * 展开/再折叠、点击菜单项选中、点击输入框定位光标。
+ */
+export function App({
+  agent,
+  config,
+  bridge,
+  mouseStdin,
+}: {
+  agent: ForgeAgent;
+  config: ForgeConfig;
+  bridge: AppBridge;
+  mouseStdin: MouseStdin;
+}) {
   const { exit } = useApp();
+  const { columns: termCols, rows: termRows } = useWindowSize();
   const [blocks, setBlocks] = useState<Block[]>([]);
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState("");
@@ -69,9 +89,14 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
   const [subStatus, setSubStatus] = useState<string | null>(null);
   // 斜杠命令菜单当前选中项下标。
   const [menuIdx, setMenuIdx] = useState(0);
+  // 视口滚动：offset = 视口底边之上的隐藏行数（0 = 跟随底部）。
+  const [scrollOffset, setScrollOffset] = useState(0);
+  // 跟随暂停期间累计的新行数（Jump 按钮「N new」）。
+  const [newCount, setNewCount] = useState(0);
+  // 鼠标点击输入框 → 请求把光标移到该列（消费后置 null）。
+  const [cursorCol, setCursorCol] = useState<number | null>(null);
 
   // 命令历史：↑/↓ 翻看已发出的命令。histIdx=null 表示在编辑新输入。
-  // 召回/清空时由 MultilineInput 检测 value 外部变化、自动把光标移到末尾（无需重挂）。
   const historyRef = useRef<string[]>([]);
   // histIdx 用 ref（不参与渲染）：避免历史回调里的 stale 闭包 / setState-内副作用。null = 在编辑新输入。
   const histIdxRef = useRef<number | null>(null);
@@ -83,16 +108,20 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
   const convBufRef = useRef(""); // Convergent 文本缓冲（与主 agent 分开）
   const turnStartRef = useRef(0);
   const workStartRef = useRef(0); // 长操作（压缩）起始时刻，用于进度行计时
+  const prevTotalRef = useRef(0); // 上一帧总行数（跟随暂停时累加新行数）
+  const scrollOffsetRef = useRef(0);
+  scrollOffsetRef.current = scrollOffset;
+
+  const pushBlock = useCallback((b: NewBlock) => {
+    setBlocks((prev) => [...prev, { ...b, id: idRef.current++ } as Block]);
+  }, []);
+  const push = useCallback((text: string) => pushBlock({ kind: "plain", text }), [pushBlock]);
 
   // working 从无到有 → 记起始；归零 → 复位（phase 更新不重置计时）
   useEffect(() => {
     if (working && workStartRef.current === 0) workStartRef.current = Date.now();
     if (!working) workStartRef.current = 0;
   }, [working]);
-
-  const push = useCallback((body: string) => {
-    setBlocks((b) => [...b, { id: idRef.current++, body }]);
-  }, []);
 
   // 串行 run 队列：用户输入与「后台子 agent 完成喂回」都走它，单线执行，互不冲突、永不撞 busy。
   const queueRef = useRef(
@@ -101,14 +130,36 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
       (err) => {
         if (isAbortErr(err)) return;
         const ex = explainApiError(err);
-        push(ansi.error(`Error: ${ex.message}`) + (ex.transient ? ansi.dim("  (press ↑ then Enter to retry)") : ""));
+        pushBlock({ kind: "error", text: ex.message, hint: ex.transient ? "(press ↑ then Enter to retry)" : undefined });
       },
       (text) => agent.steer(text), // 忙时插话：注入当前 run，不打断当前步
     ),
   );
   const runMain = useCallback((text: string) => queueRef.current.enqueue(text), []);
 
-  // 事件流 → 状态
+  // 启动横幅（备用屏内的第一个 block，取代旧版 stdout 直写）
+  useEffect(() => {
+    const sb = getSandboxStatus();
+    const live = config.live ? "\x1b[32m● LIVE\x1b[0m" : "\x1b[31m● no key\x1b[0m";
+    const lines = [
+      ...renderBanner(),
+      "",
+      ` ${ansi.dim("Terminal Coding Agent ·")} ${config.modelRef} ${ansi.dim("·")} ${live}`,
+    ];
+    if (sb.backend === "none" && sb.enabled) {
+      lines.push(` ${ansi.amber("⚠ sandbox: NO BACKEND")} ${ansi.dim(`— 命令未沙箱（仅环境白名单清洗）。${sb.reason}`)}`);
+    } else if (sb.backend !== "none") {
+      lines.push(` ${ansi.dim(`sandbox: ${sb.backend} (${sb.reason})`)}`);
+    }
+    if (config.allowReadOutsideWorkdir) {
+      lines.push(` ${ansi.amber("⚠ read-outside-workdir ON")} ${ansi.dim("— read-only tools may read outside workdir")}`);
+    }
+    lines.push("", ansi.dim("滚轮/PgUp 回看历史 · 点击折叠的工具结果可展开 · /exit 退出"));
+    pushBlock({ kind: "banner", lines });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 事件流 → block
   useEffect(() => {
     return agent.subscribe((e: HarnessEvent) => {
       switch (e.type) {
@@ -129,9 +180,9 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
         case "message_end":
           if ((e.message as { role?: string }).role === "assistant") {
             const think = thinkRef.current.trim();
-            if (think) push(ansi.dim(`${SPARK_REST} Thinking · ~${Math.round(think.length / 4)} tokens (collapsed)`));
+            if (think) pushBlock({ kind: "thinking", tokens: Math.round(think.length / 4) });
             const t = bufRef.current.trim();
-            if (t) push(`${ansi.assistant("●")} ${renderMarkdown(t).replace(/\n/g, "\n  ")}`);
+            if (t) pushBlock({ kind: "markdown", source: t });
             bufRef.current = "";
             thinkRef.current = "";
           }
@@ -139,7 +190,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
         case "turn_end": {
           const secs = ((Date.now() - turnStartRef.current) / 1000).toFixed(1);
           const out = (e.message as AssistantMessage | undefined)?.usage?.output ?? 0;
-          push(ansi.dim(`  ${secs}s · ${out} tokens`));
+          pushBlock({ kind: "turn", secs, out });
           const t = agent.telemetry;
           setDash({ turns: t.turns, inTok: t.inputTokens, outTok: t.outputTokens, cost: t.costRmb, ctxUsed: agent.contextTokens, cacheHit: t.cacheHitRate() });
           break;
@@ -147,35 +198,50 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
         case "tool_start": {
           const verb = WRITE_VERB[e.toolName];
           const path = (e.args as { path?: string } | undefined)?.path;
-          if (verb && path) push(`${ansi.tool("●")} ${ansi.bold(`${verb}(${path})`)}`);
-          else if (e.toolName === "apply_patch") push(`${ansi.tool("●")} ${ansi.bold("Patch")}`);
-          else push(`${ansi.tool("●")} ${ansi.bold(e.toolName)}${ansi.dim(`(${summarizeToolArgs(e.toolName, e.args)})`)}`);
+          const header =
+            verb && path
+              ? `${ansi.tool("●")} ${ansi.bold(`${verb}(${path})`)}`
+              : e.toolName === "apply_patch"
+                ? `${ansi.tool("●")} ${ansi.bold("Patch")}`
+                : `${ansi.tool("●")} ${ansi.bold(e.toolName)}${ansi.dim(`(${summarizeToolArgs(e.toolName, e.args)})`)}`;
+          pushBlock({ kind: "tool", toolCallId: e.toolCallId, header });
           break;
         }
         case "tool_end": {
           const details = (e.result as { details?: { diff?: FileDiff; diffs?: FileDiff[] } } | undefined)?.details;
-          // 写类工具成功 → 渲染 Claude-Code 风格 diff（单文件 details.diff / 多文件 details.diffs）
-          if (!e.isError && details?.diff) {
-            push(renderFileDiff(details.diff));
-            break;
-          }
-          if (!e.isError && Array.isArray(details?.diffs)) {
-            for (const fd of details.diffs) push(`  ${ansi.bold(`${fd.verb}(${fd.path})`)}\n${renderFileDiff(fd)}`);
-            break;
-          }
-          // read_file：显示读取的行范围，而非文件内容首行
-          const readLine = !e.isError && e.toolName === "read_file" ? readFileResultLine(details) : null;
-          const preview =
-            readLine ??
-            String((e.result?.content?.[0] as { text?: string } | undefined)?.text ?? "")
-              .split("\n")[0]
-              .slice(0, 80);
-          const mark = e.isError ? ansi.error("✗") : ansi.dim("⎿");
-          push(`  ${mark} ${ansi.dim(preview)}`);
+          const fullText = String((e.result?.content?.[0] as { text?: string } | undefined)?.text ?? "");
+          const body: ToolBody | undefined = details?.diff
+            ? { kind: "diff", diffs: [details.diff] }
+            : Array.isArray(details?.diffs)
+              ? { kind: "diff", diffs: details.diffs }
+              : fullText
+                ? {
+                    kind: "text",
+                    preview:
+                      (readFileResultLine(details) ?? fullText.split("\n")[0] ?? "").slice(0, 80) || "(无输出)",
+                    full: fullText,
+                    isError: e.isError,
+                  }
+                : undefined;
+          // 找到 tool_start 留下的 block，补上结果体（头部+结果同 block → 点击一起折叠）
+          setBlocks((prev) => {
+            for (let i = prev.length - 1; i >= 0; i--) {
+              const b = prev[i];
+              if (b.kind === "tool" && b.toolCallId === e.toolCallId && !b.body) {
+                const next = [...prev];
+                next[i] = { ...b, body, collapsed: body ? defaultCollapsed(body) : false };
+                return next;
+              }
+            }
+            // 没找到（理论上不会）：单push一个结果 block
+            return body
+              ? [...prev, { id: idRef.current++, kind: "tool" as const, toolCallId: e.toolCallId, header: ansi.dim("(tool)"), body, collapsed: defaultCollapsed(body) }]
+              : prev;
+          });
           break;
         }
         case "compaction_end": {
-          // 压缩完成：lastContextTokens 已被 forge-agent 即时回填，刷新仪表盘 ctx + token/成本
+          // 压缩完成：lastContextTokens 已被 forge-agent 即时回填，刷新仪表盘
           const t = agent.telemetry;
           setDash({ turns: t.turns, inTok: t.inputTokens, outTok: t.outputTokens, cost: t.costRmb, ctxUsed: agent.contextTokens, cacheHit: t.cacheHitRate() });
           break;
@@ -187,21 +253,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
           break;
       }
     });
-  }, [agent, push]);
-
-  // 终端 resize（拖拽调整窗口）：Ink 按旧列宽擦除旧帧会错位——边框行折行后把屏幕刷满 ─。
-  // 处理：清屏（只清可视区 \x1b[2J，不动 scrollback 里的历史）+ 触发整帧重绘。
-  const { stdout: io } = useStdout();
-  useEffect(() => {
-    const onResize = () => {
-      io.write("\x1b[2J\x1b[H");
-      setTick((t) => t + 1);
-    };
-    io.on("resize", onResize);
-    return () => {
-      io.off("resize", onResize);
-    };
-  }, [io]);
+  }, [agent, pushBlock]);
 
   // 注册 confirm / notice / status 桥
   useEffect(() => {
@@ -217,14 +269,14 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
     bridge.convergentEvent = (e: HarnessEvent) => {
       switch (e.type) {
         case "message_update": {
-          const ev = e.event as { type: string; delta?: string }; // 0.85：delta 字段改名 event
+          const ev = e.event as { type: string; delta?: string };
           if (ev.type === "text_delta" && ev.delta) convBufRef.current += ev.delta;
           break;
         }
         case "message_end":
           if ((e.message as { role?: string }).role === "assistant") {
             const t = convBufRef.current.trim();
-            if (t) push(`${ansi.amber("⟢ Convergent")} ${renderMarkdown(t).replace(/\n/g, "\n  ")}`);
+            if (t) pushBlock({ kind: "markdown", source: t, prefix: ansi.amber("⟢ Convergent") });
             convBufRef.current = "";
           }
           break;
@@ -240,7 +292,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
           break;
       }
     };
-  }, [bridge, push, runMain]);
+  }, [bridge, push, pushBlock, runMain]);
 
   // busy 或长操作进行中：驱动 spinner / 状态行 / 计时刷新
   useEffect(() => {
@@ -302,8 +354,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
   const menuOpen = menuShouldOpen(input);
   const menuSel = Math.min(menuIdx, menuMatches.length - 1);
 
-  // 菜单打开时 ↑↓/Tab 控制菜单（↑↓ 循环选择 · Tab 补全）。菜单关闭时这些键交给
-  // MultilineInput（行内移动光标 / 边界翻历史），故本 hook 仅在菜单打开时生效。
+  // 菜单打开时 ↑↓/Tab 控制菜单（↑↓ 循环选择 · Tab 补全）。
   useInput(
     (_ch, key) => {
       if (key.tab) {
@@ -320,6 +371,32 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
     { isActive: menuOpen && confirm === null },
   );
 
+  // 视口滚动键：PgUp/PgDn 半屏，Shift+↑/↓ 单行，Ctrl+End 跳底恢复跟随
+  useInput(
+    (_ch, key) => {
+      const height = viewportHeightRef.current;
+      const total = flatRef.current.lines.length;
+      if (key.pageUp) return setScrollOffset(scrollBy({ total, height, offset: scrollOffsetRef.current }, Math.max(3, Math.floor(height / 2))));
+      if (key.pageDown) return scrollEnd(-Math.max(3, Math.floor(height / 2)));
+      if (key.upArrow && key.shift) return setScrollOffset(scrollBy({ total, height, offset: scrollOffsetRef.current }, 1));
+      if (key.downArrow && key.shift) return scrollEnd(-1);
+      if (key.end && key.ctrl) return jumpToBottom();
+    },
+    { isActive: confirm === null },
+  );
+
+  const jumpToBottom = useCallback(() => {
+    setScrollOffset(0);
+    setNewCount(0);
+  }, []);
+  const scrollEnd = useCallback((delta: number) => {
+    setScrollOffset((prev) => {
+      const next = scrollBy({ total: flatRef.current.lines.length, height: viewportHeightRef.current, offset: prev }, delta);
+      if (next === 0) setNewCount(0);
+      return next;
+    });
+  }, []);
+
   // 命令历史翻页（MultilineInput 在首行↑ / 尾行↓ 时回调）。histIdx=null 表示在编辑新输入。
   const historyPrev = useCallback(() => {
     const h = historyRef.current;
@@ -327,7 +404,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
     const cur = histIdxRef.current;
     const idx = cur === null ? h.length - 1 : Math.max(0, cur - 1);
     histIdxRef.current = idx;
-    setInput(h[idx]);
+    setInput(h[idx]!);
   }, []);
   const historyNext = useCallback(() => {
     const h = historyRef.current;
@@ -339,19 +416,18 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
     } else {
       const idx = cur + 1;
       histIdxRef.current = idx;
-      setInput(h[idx]);
+      setInput(h[idx]!);
     }
   }, []);
 
-  // 斜杠命令分发表（{name → handler}）：加命令 = 这里加一条 + commands.ts 的 COMMANDS 加一条。
-  // /exit、/quit 在 onSubmit 里先于回显特判（直接退出、不回显）。
+  // 斜杠命令分发表：加命令 = 这里加一条 + commands.ts 的 COMMANDS 加一条。
   const slashHandlers = useMemo<Record<string, () => void | Promise<void>>>(
     () => ({
       "/stats": () => push(agent.telemetry.summary()),
       "/pass-permissions": () => {
         agent.passPermissions(); // 默认已开：此命令现在只是显式确认（幂等）
         setBypass(true);
-        push(ansi.dim("Permission bypass 已默认开启（--confirm 可回到逐次确认）。灾难命令（rm -rf /、fork bomb、裸写磁盘）仍被硬拦。"));
+        push(ansi.dim("Permission bypass 已默认开启（--confirm 可回到逐次确认）。灾难命令仍被硬拦。"));
       },
       "/skills": () => {
         const sk = agent.listSkills();
@@ -382,7 +458,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
         exit();
         return;
       }
-      push(`\x1b[97m›\x1b[0m ${line}`); // › + 1 空格 = 2 列槽位，与 ● / ✦ 对齐
+      pushBlock({ kind: "user", text: line });
       // /converge 是带参命令（/converge <目标> · /converge · /converge clear），单独处理
       if (line === "/converge" || line.startsWith("/converge ")) {
         const arg = line.slice("/converge".length).trim();
@@ -402,67 +478,182 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
       // 忙时插话(steer 注入当前 run) / 闲时新任务(enqueue)，均不阻塞输入
       if (queueRef.current.submit(line) === "steered") push(ansi.dim("↳ 已插入当前任务 — 本步完成后送达"));
     },
-    [agent, exit, push, menuIdx, runMain, slashHandlers],
+    [agent, exit, push, pushBlock, menuIdx, runMain, slashHandlers],
   );
 
+  // ── 视口与布局（每帧重算；block 行渲染有 (id,width) 记忆化兜底）──────────────────
   const secs = busy ? Math.floor((Date.now() - turnStartRef.current) / 1000) : 0;
   const wsecs = working && workStartRef.current ? Math.floor((Date.now() - workStartRef.current) / 1000) : 0;
   const estTok = Math.round(bufRef.current.length / 4);
   const win = agent.contextWindow;
   const pct = win ? Math.min(100, Math.round((dash.ctxUsed / win) * 100)) : 0;
   const model = config.modelRef.split("/")[1] ?? config.modelRef;
-  // 沙箱状态：正常低调显示后端名；降级琥珀色警示（旧版静默降级的问题不再）
   const sb = getSandboxStatus();
-  const sandboxLine =
-    sb.backend === "none"
-      ? sb.enabled
-        ? <Text color={theme.amber}> · ⚠ 未沙箱</Text>
-        : ""
-      : ` · ${sb.backend}`;
   const frame = sparkFrame();
+
+  const width = Math.max(20, termCols);
+  const flat = useMemo(() => flattenBlocks(blocks, width), [blocks, width]);
+
+  // chrome（视口之下的固定区）各段行数，自上而下：
+  const reasoningLines =
+    busy && thinkRef.current && !bufRef.current
+      ? wrapVisible(thinkRef.current.trim(), width - 4).split("\n").slice(-8)
+      : [];
+  const jumpLine = scrollOffset > 0 ? 1 : 0;
+  const menuLines = menuOpen && !confirm ? menuMatches.length + 1 : 0;
+  const subDashLines = agent.subTelemetry.turns > 0 ? 1 : 0;
+  const subStatusLines = subStatus ? 1 : 0;
+  const chromeHeight =
+    jumpLine +
+    reasoningLines.length +
+    (busy ? 1 : 0) +
+    (working ? 1 : 0) +
+    menuLines +
+    3 + // 输入框：上下边框 + 内容行
+    1 + // 仪表盘
+    subDashLines +
+    subStatusLines;
+  // 视口高度 = 终端行数 − chrome − 1 安全行：帧高恰好顶满终端时，写最后一行会引发
+  // 屏幕上滚一格 → 整帧错位级联（实测 PTY 里字符逐行炸开）。留 1 行余量根治。
+  const viewportHeight = Math.max(0, termRows - chromeHeight - 1);
+
+  const vis = visible({ total: flat.lines.length, height: viewportHeight, offset: scrollOffset });
+  // offset 被钳制（resize/内容缩短）时同步回 state
+  if (vis.clampedOffset !== scrollOffset) setScrollOffset(vis.clampedOffset);
+
+  // 跟随暂停时累计新行；恢复跟随时清零
+  useEffect(() => {
+    const total = flat.lines.length;
+    const delta = total - prevTotalRef.current;
+    prevTotalRef.current = total;
+    if (delta > 0 && scrollOffsetRef.current > 0) setNewCount((n) => n + delta);
+    else if (scrollOffsetRef.current === 0) setNewCount(0);
+  }, [flat.lines.length]);
+
+  // 供输入处理闭包读的「本帧」值
+  const flatRef = useRef(flat);
+  flatRef.current = flat;
+  const viewportHeightRef = useRef(viewportHeight);
+  viewportHeightRef.current = viewportHeight;
+
+  // 可见行 → blockId 映射 + chrome 各可点区行号（屏幕 1-based 行）——每次渲染后更新供鼠标命中
+  const zonesRef = useRef<{ viewportRows: number; jumpRow: number | null; menuTop: number | null; inputRow: number | null }>({
+    viewportRows: 0,
+    jumpRow: null,
+    menuTop: null,
+    inputRow: null,
+  });
+  zonesRef.current = (() => {
+    let row = viewportHeight; // 视口占 1..viewportHeight
+    const z = { viewportRows: viewportHeight, jumpRow: null as number | null, menuTop: null as number | null, inputRow: null as number | null };
+    row += jumpLine;
+    if (jumpLine) z.jumpRow = row;
+    row += reasoningLines.length;
+    row += busy ? 1 : 0;
+    row += working ? 1 : 0;
+    if (menuLines) {
+      z.menuTop = row + 1; // 菜单第一项（1-based）
+      row += menuLines;
+    }
+    row += 1; // 输入框上边框
+    z.inputRow = row + 1;
+    return z;
+  })();
+
+  // ── 鼠标 ────────────────────────────────────────────────────────────────────
+  const toggleToolBlock = useCallback((toolCallIdOrBlockId: number) => {
+    setBlocks((prev) =>
+      prev.map((b) => (b.id === toolCallIdOrBlockId && b.kind === "tool" && b.body ? { ...b, collapsed: !b.collapsed } : b)),
+    );
+  }, []);
+
+  useEffect(() => {
+    return mouseStdin.onMouseEvent((ev: MouseEvent) => {
+      const total = flatRef.current.lines.length;
+      if (ev.kind === "wheel") {
+        const delta = ev.button === 64 ? 3 : -3; // 64=上滚(看历史) 65=下滚
+        setScrollOffset((prev) => {
+          const next = scrollBy({ total, height: viewportHeightRef.current, offset: prev }, delta);
+          if (next === 0) setNewCount(0);
+          return next;
+        });
+        return;
+      }
+      if (ev.kind !== "press" || ev.button !== 0) return; // v1 只处理左键点击
+      const z = zonesRef.current;
+      if (z.jumpRow === ev.row) return jumpToBottom();
+      if (z.menuTop !== null && ev.row >= z.menuTop && ev.row < z.menuTop + menuMatches.length) {
+        setMenuIdx(ev.row - z.menuTop);
+        return;
+      }
+      if (z.inputRow === ev.row && confirm === null) {
+        setCursorCol(Math.max(0, ev.col - 2)); // `› ` 前缀占 2 列
+        return;
+      }
+      if (ev.row <= z.viewportRows && ev.row >= 1) {
+        // 视口行 → 展开后的行下标 → 所属 block
+        const lineIdx = visStartRef.current + (ev.row - 1);
+        const blockId = flatRef.current.owner[lineIdx];
+        if (blockId !== undefined) {
+          const b = blocksRef.current.find((x) => x.id === blockId);
+          if (b?.kind === "tool" && b.body) toggleToolBlock(b.id);
+        }
+      }
+    });
+  }, [mouseStdin, confirm, menuMatches.length, jumpToBottom, toggleToolBlock]);
+
+  const visStartRef = useRef(vis.start);
+  visStartRef.current = vis.start;
+  const blocksRef = useRef(blocks);
+  blocksRef.current = blocks;
+
+  const viewportText = flat.lines.slice(vis.start, vis.start + vis.count).join("\n");
 
   return (
     <Box flexDirection="column">
-      <Static items={blocks}>
-        {(b) => (
-          <Box key={b.id} marginBottom={1}>
-            <Text>{b.body}</Text>
-          </Box>
-        )}
-      </Static>
+      <Box flexDirection="column" height={viewportHeight}>
+        <Text>{viewportText}</Text>
+      </Box>
 
-      {busy && thinkRef.current && !bufRef.current && (
-        <Box flexDirection="column" marginBottom={1}>
-          <Text color={theme.muted}>{`${sparkFrame()} Reasoning`}</Text>
-          {/* 先按内容宽折行再取末 8 行：长行不顶到第 0 列，且高度恒定 ≤8 行 */}
-          <Text color={theme.muted}>{"  " + wrapVisible(thinkRef.current.trim(), contentWidth()).split("\n").slice(-8).join("\n  ")}</Text>
+      {scrollOffset > 0 && (
+        <Box>
+          <Text color={theme.amber}>
+            {`↺ ${newCount > 0 ? `${newCount} new · ` : ""}Jump to bottom（点击 / 滚到底 / Ctrl+End）`}
+          </Text>
+        </Box>
+      )}
+
+      {reasoningLines.length > 0 && (
+        <Box flexDirection="column">
+          <Text color={theme.muted}>{`${frame} Reasoning`}</Text>
+          {reasoningLines.map((l, i) => (
+            <Text key={i} color={theme.muted}>
+              {`  ${l}`}
+            </Text>
+          ))}
         </Box>
       )}
 
       {busy && (
-        <Box marginBottom={1}>
-          <Text color={theme.spinner}>{frame}</Text>
+        <Box>
           <Text color={theme.muted}>
-            {" "}
-            Thinking ({secs}s{estTok > 0 ? ` · ~${estTok} tokens` : ""})
+            {`${frame} Thinking (${secs}s${estTok > 0 ? ` · ~${estTok} tokens` : ""})`}
           </Text>
         </Box>
       )}
 
       {working && (
-        <Box marginBottom={1}>
-          <Text color={theme.spinner}>{frame}</Text>
-          <Text color={theme.amber}>{` ↻ ${working}`}</Text>
+        <Box>
+          <Text color={theme.amber}>{`↻ ${working}`}</Text>
           <Text color={theme.muted}>{` (${wsecs}s)`}</Text>
         </Box>
       )}
 
       {menuOpen && !confirm && (
-        <Box flexDirection="column" marginBottom={1}>
+        <Box flexDirection="column">
           {menuMatches.map((c, i) => (
-            <Text key={c.name}>
-              <Text color={i === menuSel ? theme.prompt : theme.muted}>{`${i === menuSel ? "❯" : " "} ${c.name}`}</Text>
-              <Text color={theme.muted}>{`   ${c.desc}`}</Text>
+            <Text key={c.name} color={i === menuSel ? theme.prompt : theme.muted}>
+              {`${i === menuSel ? "❯" : " "} ${c.name}   ${c.desc}`}
             </Text>
           ))}
           <Text color={theme.muted}>{"  ↑↓ select · Tab complete · Enter run"}</Text>
@@ -487,19 +678,24 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
               onHistoryNext={historyNext}
               menuOpen={menuOpen}
               isActive={confirm === null}
+              cursorRequest={cursorCol}
+              onCursorRequestHandled={() => setCursorCol(null)}
             />
-            {/* 占位提示：浅灰，仅空输入时 */}
             {!input && <Text color={theme.muted}>Type a request · /exit to quit</Text>}
           </Box>
         )}
       </Box>
 
-      <Box marginTop={1}>
+      <Box>
         <Text color={theme.muted}>
           ▌ {model} · ctx {human(dash.ctxUsed)}/{human(win)} ({pct}%) · {dash.turns} turns · ↑{human(dash.inTok)} ↓
           {human(dash.outTok)} tok · cache {Math.round(dash.cacheHit * 100)}% · ¥{dash.cost.toFixed(4)}
           {bypass ? <Text color={theme.error}> · bypass</Text> : ""}
-          {sandboxLine}
+          {sb.backend === "none"
+            ? sb.enabled
+              ? <Text color={theme.amber}> · ⚠ 未沙箱</Text>
+              : ""
+            : ` · ${sb.backend}`}
         </Text>
       </Box>
 
@@ -507,8 +703,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
         <Box>
           <Text color={theme.muted}>
             ▌ {agent.subTelemetry.model || "subagent"} · {agent.subTelemetry.turns} turns · ↑{human(agent.subTelemetry.inputTokens)} ↓
-            {human(agent.subTelemetry.outputTokens)} tok · cache {Math.round(agent.subTelemetry.cacheHitRate() * 100)}% · ¥
-            {agent.subTelemetry.costRmb.toFixed(4)}
+            {human(agent.subTelemetry.outputTokens)} tok · ¥{agent.subTelemetry.costRmb.toFixed(4)}
           </Text>
         </Box>
       )}

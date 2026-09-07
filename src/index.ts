@@ -7,6 +7,7 @@ import { App, type AppBridge } from "./ui/app.js";
 import { renderBanner, ansi } from "./ui/theme.js";
 import { explainApiError } from "./kernel/errors.js";
 import { getSandboxStatus } from "./sandbox/exec.js";
+import { TerminalIo, createMouseStdin } from "./ui/terminal-io.js";
 
 /** Ctrl+C / EOF 触发的中断。 */
 function isAbort(e: unknown): boolean {
@@ -69,8 +70,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // 2) 交互式 REPL：渲染 Ink TUI（输出滚动区在上、输入框 + 仪表盘钉在底部）
-  banner(config, "Type a request to begin  ·  /skills /compact /stats /pass-permissions(默认开) ·  /exit to quit");
+  // 2) 交互式 REPL：全屏 TUI（备用屏 + 虚拟视口 + 鼠标，Claude Code 式）
   const bridge: AppBridge = { confirm: async () => true, notice: () => {}, status: () => {}, subagent: () => {}, resume: () => {}, convergentEvent: () => {} };
   const agent = await ForgeAgent.create(config, {
     autoApprove,
@@ -82,9 +82,19 @@ async function main(): Promise<void> {
     onResume: (t) => bridge.resume(t),
     onConvergentEvent: (e) => bridge.convergentEvent(e),
   });
+  // 备用屏 + 鼠标上报；Ink 喂过滤后的 stdin（鼠标序列剥走，键盘/粘贴原样透传）
+  const io = new TerminalIo(stdout);
+  const mouseStdin = createMouseStdin(process.stdin);
+  io.enter();
   // exitOnCtrlC:false → 由 App 自己接管 Ctrl+C（运行中=中止 / 有输入=清空 / 空输入按两次=退出）
-  const app = render(createElement(App, { agent, config, bridge }), { exitOnCtrlC: false });
+  // stdin 断言：Ink 类型要 ReadStream，运行时只用 on/setRawMode/isTTY——代理全部提供。
+  const app = render(createElement(App, { agent, config, bridge, mouseStdin }), {
+    stdin: mouseStdin as unknown as NodeJS.ReadStream,
+    exitOnCtrlC: false,
+  });
   await app.waitUntilExit();
+  (mouseStdin as unknown as { detach?: () => void }).detach?.(); // 解除真实 stdin 监听，放行进程退出
+  io.restore(); // 出备用屏、关鼠标、恢复光标 → 摘要在主屏打印
   finish(agent, config);
   await agent.dispose(); // 关闭 LSP server 子进程
 }

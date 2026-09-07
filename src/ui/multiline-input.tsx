@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Text, useInput } from "ink";
 import * as ed from "./text-editor.js";
+import { visibleWidth } from "./markdown.js";
 
 /**
  * 多行输入框 —— 取代单行的 ink-text-input（其多行渲染会糊、且 ↑/↓ 一律翻历史）。
@@ -19,6 +20,8 @@ export function MultilineInput({
   onHistoryNext,
   menuOpen,
   isActive,
+  cursorRequest,
+  onCursorRequestHandled,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -27,22 +30,55 @@ export function MultilineInput({
   onHistoryNext: () => void;
   menuOpen: boolean;
   isActive: boolean;
+  /** 鼠标点击输入框的列号（1-based，相对 `› ` 前缀之后）→ 请求把光标移到该列。消费后调 onCursorRequestHandled 清空。 */
+  cursorRequest?: number | null;
+  onCursorRequestHandled?: () => void;
 }) {
   const [cursor, setCursor] = useState(value.length);
   const emittedRef = useRef(value); // 最近一次「我们自己」改出去的 value
+  // 键处理读同步镜像而非闭包 prop/state：同一 tick 内连续到达的键事件（代理把合并的
+  // chunk 拆开后一次喂多个，或极端快速连打）会读到未提交的旧闭包——曾致 onSubmit("") 丢输入。
+  const valueRef = useRef(value);
+  const cursorRef = useRef(value.length);
 
   // 外部改 value（非本组件编辑）→ 光标移到末尾
   useEffect(() => {
+    valueRef.current = value;
     if (value !== emittedRef.current) {
       emittedRef.current = value;
-      setCursor(value.length);
+      moveCursor(value.length);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
+
+  // 鼠标点击定位：列号 → 字符下标（按可见宽度折算，中文占 2 列）
+  useEffect(() => {
+    if (cursorRequest == null) return;
+    let acc = 0;
+    let idx = value.length;
+    for (let i = 0; i < value.length; i++) {
+      const w = visibleWidth(value[i]!);
+      if (acc + Math.floor(w / 2) >= cursorRequest) {
+        idx = i;
+        break;
+      }
+      acc += w;
+    }
+    moveCursor(idx);
+    onCursorRequestHandled?.();
+  }, [cursorRequest, value, onCursorRequestHandled]);
 
   const apply = (s: ed.EditorState) => {
     emittedRef.current = s.text;
-    setCursor(ed.clampCursor(s.text, s.cursor));
+    valueRef.current = s.text;
+    const c = ed.clampCursor(s.text, s.cursor);
+    cursorRef.current = c;
+    setCursor(c);
     onChange(s.text);
+  };
+  const moveCursor = (c: number) => {
+    cursorRef.current = c;
+    setCursor(c);
   };
 
   useInput(
@@ -51,30 +87,32 @@ export function MultilineInput({
       if (key.tab) return; // Tab 不入框：菜单开时父处理，菜单关时忽略
       if (menuOpen && (key.upArrow || key.downArrow)) return; // ↑↓ 让给菜单
 
+      const v = valueRef.current;
+      const cur = cursorRef.current;
       if (key.return) {
-        if (key.meta || key.shift) apply(ed.insert({ text: value, cursor }, "\n"));
-        else onSubmit(value);
+        if (key.meta || key.shift) apply(ed.insert({ text: v, cursor: cur }, "\n"));
+        else onSubmit(v);
         return;
       }
       if (key.upArrow) {
-        const t = ed.moveUp(value, cursor);
+        const t = ed.moveUp(v, cur);
         if (t === null) onHistoryPrev();
-        else setCursor(t);
+        else moveCursor(t);
         return;
       }
       if (key.downArrow) {
-        const t = ed.moveDown(value, cursor);
+        const t = ed.moveDown(v, cur);
         if (t === null) onHistoryNext();
-        else setCursor(t);
+        else moveCursor(t);
         return;
       }
-      if (key.leftArrow) return setCursor(ed.clampCursor(value, cursor - 1));
-      if (key.rightArrow) return setCursor(ed.clampCursor(value, cursor + 1));
-      if (key.backspace || key.delete) return apply(ed.backspace({ text: value, cursor }));
-      if (key.ctrl && input === "a") return setCursor(ed.lineHome(value, cursor));
-      if (key.ctrl && input === "e") return setCursor(ed.lineEnd(value, cursor));
+      if (key.leftArrow) return moveCursor(ed.clampCursor(v, cur - 1));
+      if (key.rightArrow) return moveCursor(ed.clampCursor(v, cur + 1));
+      if (key.backspace || key.delete) return apply(ed.backspace({ text: v, cursor: cur }));
+      if (key.ctrl && input === "a") return moveCursor(ed.lineHome(v, cur));
+      if (key.ctrl && input === "e") return moveCursor(ed.lineEnd(v, cur));
       // 可打印（含批量粘贴，可能带换行）；排除控制/修饰组合
-      if (input && !key.ctrl && !key.meta) apply(ed.insert({ text: value, cursor }, ed.normalizeNewlines(input)));
+      if (input && !key.ctrl && !key.meta) apply(ed.insert({ text: v, cursor: cur }, ed.normalizeNewlines(input)));
     },
     { isActive },
   );

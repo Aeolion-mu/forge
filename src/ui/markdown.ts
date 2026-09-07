@@ -240,7 +240,8 @@ function renderTable(rows: string[][]): string {
   return [bar("┌", "┬", "┐"), renderRow(rows[0]), bar("├", "┼", "┤"), ...rows.slice(1).map(renderRow), bar("└", "┴", "┘")].join("\n");
 }
 
-export function renderMarkdown(md: string): string {
+/** cols：内容宽度预算（终端列数）。缺省取当前终端宽；全屏视口按渲染期宽度传入 → resize 重排。 */
+export function renderMarkdown(md: string, cols: number = termCols()): string {
   const lines = md.split("\n");
   const out: string[] = [];
   let i = 0;
@@ -287,7 +288,7 @@ export function renderMarkdown(md: string): string {
 
     // 分隔线
     if (/^\s*([-*_])\1{2,}\s*$/.test(line)) {
-      out.push(dim("─".repeat(Math.min(termCols() - GUTTER, 60))));
+      out.push(dim("─".repeat(Math.min(cols - GUTTER, 60))));
       i += 1;
       continue;
     }
@@ -330,5 +331,5 @@ export function renderMarkdown(md: string): string {
   }
   // 折到 termCols-GUTTER：渲染层的 2 空格悬挂缩进会把折出的续行一并推到内容列，
   // 长行不再顶到终端第 0 列、与 `● / › / ✦` 状态符撞列（GUTTER 含 1 列右侧安全余量）。
-  return wrapVisible(out.join("\n"), termCols() - GUTTER);
+  return wrapVisible(out.join("\n"), cols - GUTTER);
 }

@@ -90,7 +90,8 @@ export function computeFileDiff(before: string, after: string, verb: string, pat
 }
 
 /** 把 FileDiff 渲染成多行字符串（供 push 到输出流）。indent 为整体缩进（2 列槽位，与 ● / ⎿ 对齐）。 */
-export function renderFileDiff(d: FileDiff, indent = "  "): string {
+/** width：内容宽度预算（终端列数）。缺省取当前终端宽；全屏视口按渲染期宽度传入。 */
+export function renderFileDiff(d: FileDiff, indent = "  ", width = contentWidth()): string {
   const head = `${indent}${ansi.dim("⎿")}  ${ansi.dim(`Added ${d.added} lines, removed ${d.removed} lines`)}`;
   if (d.lines.length === 0) return head;
 
@@ -99,7 +100,7 @@ export function renderFileDiff(d: FileDiff, indent = "  "): string {
     3,
   );
   const lang = langForPath(d.path);
-  const band = Math.max(20, contentWidth()); // 色带可见宽度（终端宽 - 悬挂缩进）
+  const band = Math.max(20, width); // 色带可见宽度（终端宽 - 悬挂缩进）
   const body: string[] = [];
   let prevNew = -1;
   for (const l of d.lines) {
