@@ -60,6 +60,9 @@ export interface ForgeConfig {
   stream: StreamConfig;
   /** 自建/内网 OpenAI 兼容端点（forge.config.json customModels）。 */
   customModels: CustomModelEntry[];
+  /** 子 Agent / flash 分类器用的模型 ref；缺省跟随主模型（旧版写死 deepseek-v4-flash，
+   *  key 失效时子 Agent 全空转、Convergent 验收静默变橡皮图章——已改为跟随主模型）。 */
+  subagentModel: string;
   /** 每百万 token 定价（人民币）：内置默认 ⊕ forge.config.json 的 pricing 覆盖/扩充。 */
   pricing: Record<string, Rate>;
   /** 只读越界：允许 read_file/list_dir/glob/grep 读 workdir 外的绝对路径（写仍锁死 workdir）。默认 false。 */
@@ -106,6 +109,7 @@ interface ForgeFile {
   defaultModel?: string;
   models?: ModelEntry[];
   customModels?: CustomModelEntry[];
+  subagentModel?: string;
   reserveTokens?: number;
   keepRecentTokens?: number;
   maxRetries?: number;
@@ -156,6 +160,10 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
   if (o.defaultModel !== undefined) {
     if (typeof o.defaultModel === "string" && o.defaultModel.trim()) out.defaultModel = o.defaultModel;
     else issues.push("defaultModel 应为非空字符串");
+  }
+  if (o.subagentModel !== undefined) {
+    if (typeof o.subagentModel === "string" && o.subagentModel.trim()) out.subagentModel = o.subagentModel;
+    else issues.push("subagentModel 应为非空字符串（provider/model 形式）");
   }
   if (o.customModels !== undefined) {
     if (!Array.isArray(o.customModels)) {
@@ -362,6 +370,7 @@ export function loadConfig(): ForgeConfig {
     model,
     live: hasKey(provider),
     customModels: activeCustomModels,
+    subagentModel: process.env.FORGE_SUBAGENT_MODEL?.trim() || file.subagentModel || modelRef,
     // 默认把 reasoning 模型拉满（xhigh→DeepSeek reasoning_effort:max）；非 reasoning 模型关掉。
     thinkingLevel: (process.env.FORGE_THINKING as ThinkingLevel) || (model.reasoning ? "xhigh" : "off"),
     models,

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Box, Text, Static, useApp, useInput } from "ink";
+import { Box, Text, Static, useApp, useInput, useStdout } from "ink";
 import { MultilineInput } from "./multiline-input.js";
 import type { HarnessEvent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -188,6 +188,20 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
       }
     });
   }, [agent, push]);
+
+  // 终端 resize（拖拽调整窗口）：Ink 按旧列宽擦除旧帧会错位——边框行折行后把屏幕刷满 ─。
+  // 处理：清屏（只清可视区 \x1b[2J，不动 scrollback 里的历史）+ 触发整帧重绘。
+  const { stdout: io } = useStdout();
+  useEffect(() => {
+    const onResize = () => {
+      io.write("\x1b[2J\x1b[H");
+      setTick((t) => t + 1);
+    };
+    io.on("resize", onResize);
+    return () => {
+      io.off("resize", onResize);
+    };
+  }, [io]);
 
   // 注册 confirm / notice / status 桥
   useEffect(() => {

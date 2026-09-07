@@ -659,8 +659,14 @@ export class ForgeAgent {
     });
 
     try {
-      await subLane.prompt(task, undefined, ctx);
+      const r = await subLane.prompt(task, undefined, ctx);
       await subLane.waitForIdle(ctx);
+      // 0.85 的 RunResult 把操作失败（API 401/超时）装在 ok:true + status:"failed" 里——
+      // 不检查就会拿空文本当结论（子 Agent 空转、Convergent 默认放行的假验收根因）。
+      if (r.ok) {
+        const v = r.value as { status?: string; error?: { message?: string } };
+        if (v.status === "failed" && v.error) throw new Error(v.error.message ?? "ephemeral run failed");
+      }
       const finalText = lastText || "(no text output)";
       const text = hitLimit ? `（达到 ${cap} 轮上限被截断，以下为当时的部分结论）\n${finalText}` : finalText;
       return { text, turns, tools: toolCalls, hitLimit };
@@ -690,7 +696,7 @@ export class ForgeAgent {
     rec: SubAgentTask,
   ): Promise<SubAgentResult> {
     const cap = maxTurns === undefined ? SUBAGENT_MAX_TURNS : maxTurns;
-    const { model, thinking } = this.resolvePreferredModel("deepseek/deepseek-v4-flash");
+    const { model, thinking } = this.resolvePreferredModel(this.config.subagentModel); // 缺省跟随主模型（旧版写死 flash，key 失效时子 Agent 全空转）
     const pushLog = (s: string) => {
       rec.log.push(s);
       if (rec.log.length > SUBAGENT_LOG_CAP) rec.log.shift();
@@ -753,7 +759,7 @@ export class ForgeAgent {
 
   /** 跑一次 Convergent 验收：fresh pro session + 只读+bash 工具 + 怀疑式 prompt + 硬拦灾难命令。 */
   private async runConvergent(goal: string, changedFiles: string[], claim: string): Promise<{ verdict: "yes" | "no"; reason: string }> {
-    const { model, thinking } = this.resolvePreferredModel("deepseek/deepseek-v4-pro");
+    const { model, thinking } = this.resolvePreferredModel(this.config.modelRef); // 验收 agent 用主模型（旧版写死 deepseek-v4-pro，key 失效时验收静默变橡皮图章）
     // 自主运行（autoApprove），但硬拒绝黑名单仍生效（写边界由沙箱内核保证，与主 agent 同一套）
     const policy = new PermissionPolicy({ autoApprove: true });
     const task = buildConvergentTask({ goal, changedFiles, agentClaim: claim });
@@ -786,7 +792,7 @@ export class ForgeAgent {
 
   /** 用 flash 给「主 agent 这一轮的最后消息」做三分类（claims_done / asking_user / blocked）。 */
   private async classifyStop(lastMessage: string): Promise<StopKind> {
-    const { model } = this.resolvePreferredModel("deepseek/deepseek-v4-flash");
+    const { model } = this.resolvePreferredModel(this.config.subagentModel);
     try {
       const messages = [{ role: "user", content: [{ type: "text", text: buildClassifierPrompt(lastMessage) }], timestamp: Date.now() }] as Message[];
       const resp = await getModels(this.config.customModels).completeSimple(
