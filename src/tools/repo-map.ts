@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { langKeyForPath, outlineSource, type CodeSymbol } from "../kernel/code-outline.js";
 import { resolveReadPath } from "./fs-tools.js";
@@ -81,14 +81,14 @@ const repoMapSchema = Type.Object({
  * repo_map 工具：一张全仓「文件 → 符号签名 + 行号」地图，用于快速建立代码库结构认知，
  * 再用 outline/read_file 钻取。受 token 预算约束，避免把整库灌进上下文。
  */
-export function makeRepoMapTool(workdir: string, allowReadOutside = false): AgentTool<typeof repoMapSchema, { files: number; budget: number }> {
+export function makeRepoMapTool(workdir: string, allowReadOutside = false): AgentHarnessTool<object | undefined, typeof repoMapSchema, { files: number; budget: number }> {
   return {
     name: "repo_map",
     label: "代码地图",
     description:
       "生成全仓（或指定子目录）的代码地图：每个源码文件的顶层符号签名 + 行号。**理解陌生代码库时先用它建立全局结构**，再用 outline 看单文件、read_file 按行精读。受 token 预算约束。支持 py/js/ts/tsx/go/rs/java。",
     parameters: repoMapSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const rootAbs = resolveReadPath(workdir, params.path ?? ".", allowReadOutside);
       const budget = params.budget && params.budget > 0 ? params.budget : 4000;
       const files = await collectRepoOutline(workdir, rootAbs);

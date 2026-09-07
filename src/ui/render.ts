@@ -1,4 +1,4 @@
-import type { AgentHarnessEvent } from "@earendil-works/pi-agent-core";
+import type { HarnessEvent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { renderMarkdown } from "./markdown.js";
 import { renderFileDiff, type FileDiff } from "./diff.js";
@@ -107,13 +107,13 @@ function makeSpinner() {
   };
 }
 
-export function makeRenderer(): (event: AgentHarnessEvent) => void {
+export function makeRenderer(): (event: HarnessEvent) => void {
   const spin = makeSpinner();
   let buffer = ""; // 助手文本缓冲，message_end 时整体渲染
   let turnStart = 0;
   const toolStart = new Map<string, number>();
 
-  return (event: AgentHarnessEvent) => {
+  return (event: HarnessEvent) => {
     switch (event.type) {
       case "message_start":
         if ((event.message as { role?: string }).role === "assistant") {
@@ -129,7 +129,8 @@ export function makeRenderer(): (event: AgentHarnessEvent) => void {
         break;
 
       case "message_update": {
-        const ev = event.assistantMessageEvent as { type: string; delta?: string };
+        // 0.85：delta 字段 assistantMessageEvent → event
+        const ev = event.event as { type: string; delta?: string };
         if (ev.type === "text_delta" && ev.delta) buffer += ev.delta; // 只缓冲，不直接打印
         break;
       }
@@ -154,8 +155,8 @@ export function makeRenderer(): (event: AgentHarnessEvent) => void {
         break;
       }
 
-      case "tool_execution_start": {
-        // 不启动 spinner：tool_execution_start 在确认钩子(rl.question [y/N])之前发，
+      case "tool_start": {
+        // 不启动 spinner：tool_start 在确认钩子(rl.question [y/N])之前发，
         // spinner 的 \r 重绘会把确认提示擦掉导致「假死」。
         spin.stop();
         toolStart.set(event.toolCallId, Date.now());
@@ -170,7 +171,7 @@ export function makeRenderer(): (event: AgentHarnessEvent) => void {
         break;
       }
 
-      case "tool_execution_end": {
+      case "tool_end": {
         spin.stop();
         const t0 = toolStart.get(event.toolCallId);
         const ms = t0 ? Date.now() - t0 : undefined;
@@ -197,7 +198,7 @@ export function makeRenderer(): (event: AgentHarnessEvent) => void {
         break;
       }
 
-      case "agent_end":
+      case "run_end":
         spin.stop();
         break;
 

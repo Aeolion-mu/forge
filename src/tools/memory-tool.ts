@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import type { TextContent } from "@earendil-works/pi-ai";
 import type { Memory, MemoryScope } from "../kernel/memory.js";
 
@@ -16,24 +16,24 @@ const writeSchema = Type.Object({
 });
 
 /** 记忆工具：read（召回）/ list（看索引）只读，write（记录）写类经确认。 */
-export function makeMemoryTools(mem: Memory): AgentTool[] {
-  const memoryRead: AgentTool<typeof readSchema, { name: string }> = {
+export function makeMemoryTools(mem: Memory): AgentHarnessTool<object | undefined>[] {
+  const memoryRead: AgentHarnessTool<object | undefined, typeof readSchema, { name: string }> = {
     name: "memory_read",
     label: "读取记忆",
     description: "按名加载一条具体记忆的全文（先查项目、再查全局）。索引里看到相关记忆时用它召回。",
     parameters: readSchema,
-    execute: async (_id, params) => ({ content: txt(mem.read(params.name)), details: { name: params.name } }),
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => ({ content: txt(mem.read(params.name)), details: { name: params.name } }),
   };
 
-  const memoryList: AgentTool<typeof listSchema, { ok: boolean }> = {
+  const memoryList: AgentHarnessTool<object | undefined, typeof listSchema, { ok: boolean }> = {
     name: "memory_list",
     label: "记忆索引",
     description: "列出全部记忆索引（全局 + 本项目）。",
     parameters: listSchema,
-    execute: async () => ({ content: txt(mem.list()), details: { ok: true } }),
+    execute: async (_id, _p, _onUpdate, _toolCtx, _invocation, _ctx) => ({ content: txt(mem.list()), details: { ok: true } }),
   };
 
-  const memoryWrite: AgentTool<typeof writeSchema, { file: string }> = {
+  const memoryWrite: AgentHarnessTool<object | undefined, typeof writeSchema, { file: string }> = {
     name: "memory_write",
     label: "记录记忆",
     description:
@@ -43,12 +43,12 @@ export function makeMemoryTools(mem: Memory): AgentTool[] {
       "记之前自问：下次新会话真的需要它吗？不确定就别记（记忆系统的失败模式是『记太多』）。" +
       "scope: project(仅本项目)/global(跨项目)。写操作经权限闸门。",
     parameters: writeSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const scope: MemoryScope = params.scope === "global" ? "global" : "project";
       const file = mem.write({ name: params.name, scope, description: params.description, type: params.type, content: params.content });
       return { content: txt(`已记录记忆「${params.name}」（${scope}）`), details: { file } };
     },
   };
 
-  return [memoryRead, memoryList, memoryWrite] as unknown as AgentTool[];
+  return [memoryRead, memoryList, memoryWrite] as unknown as AgentHarnessTool<object | undefined>[];
 }

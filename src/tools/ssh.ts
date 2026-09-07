@@ -2,8 +2,8 @@ import { homedir, tmpdir } from "node:os";
 import { writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { spawnCaptured, scrubbedEnv } from "../sandbox/exec.js";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
+import { spawnCaptured, scrubbedEnv, signalOf } from "../sandbox/exec.js";
 import { truncateForContext } from "../kernel/artifacts.js";
 import type { SshProfile } from "../config.js";
 
@@ -95,7 +95,7 @@ function passwordEnv(password: string): NodeJS.ProcessEnv {
  */
 export function makeSshTool(
   profiles: Record<string, SshProfile>,
-): AgentTool<ReturnType<typeof makeSchema>, { exitCode: number; ms: number; timedOut: boolean; truncated: boolean; profile: string; host: string; artifact?: string }> {
+): AgentHarnessTool<object | undefined, ReturnType<typeof makeSchema>, { exitCode: number; ms: number; timedOut: boolean; truncated: boolean; profile: string; host: string; artifact?: string }> {
   const names = Object.keys(profiles);
   const schema = makeSchema(names);
   return {
@@ -105,7 +105,7 @@ export function makeSshTool(
       ? `通过 SSH 在预配置的远程主机执行命令（非交互：BatchMode + 免密钥认证）。可用档案：${names.join(", ")}。返回远程命令的 stdout/stderr 合并输出 + 退出码。`
       : "通过 SSH 在远程主机执行命令。当前 forge.config.json 未配置任何 ssh 档案——需先在 ssh 段添加才能用。",
     parameters: schema,
-    execute: async (_id, params, signal) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, context) => {
       const profile = profiles[params.profile];
       if (!profile) {
         const text = names.length
@@ -118,7 +118,7 @@ export function makeSshTool(
       }
       const args = buildSshArgs(profile, params.command);
       const env = profile.password ? passwordEnv(profile.password) : scrubbedEnv();
-      const r = await spawnCaptured("ssh", args, { timeoutMs: params.timeoutMs ?? 30000, env, signal });
+      const r = await spawnCaptured("ssh", args, { timeoutMs: params.timeoutMs ?? 30000, env, signal: signalOf(context) });
       const t = truncateForContext(r.out, { workdir: process.cwd(), save: true });
       return {
         content: [{ type: "text", text: `[ssh ${params.profile} → ${profile.host}] exit=${r.code}\n${t.text}` }],

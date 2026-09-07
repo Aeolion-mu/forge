@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { getEnvApiKey, getModel } from "@earendil-works/pi-ai";
+// 0.85 起 pi-ai 根入口不再导出这些函数；/compat 是官方临时 shim（签名不变）。
+import { getEnvApiKey, getModel } from "@earendil-works/pi-ai/compat";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { DEFAULT_RMB_PER_M, type Rate } from "./kernel/pricing.js";

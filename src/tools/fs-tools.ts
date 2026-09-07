@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { computeFileDiff, type FileDiff } from "../ui/diff.js";
 import { truncateForContext } from "../kernel/artifacts.js";
@@ -51,15 +51,15 @@ function countOccurrences(hay: string, needle: string): number {
   return n;
 }
 
-export function makeFsTools(workdir: string, allowReadOutside = false): AgentTool[] {
+export function makeFsTools(workdir: string, allowReadOutside = false): AgentHarnessTool<object | undefined>[] {
   const outsideHint = allowReadOutside ? "已开启只读越界：path 也可为 workdir 外的绝对路径（如审查其它项目）。" : "";
-  const readFile: AgentTool<typeof readFileSchema, { path: string; lines: number; from: number; truncated: boolean }> = {
+  const readFile: AgentHarnessTool<object | undefined, typeof readFileSchema, { path: string; lines: number; from: number; truncated: boolean }> = {
     name: "read_file",
     label: "读取文件",
     description:
       `读取文件，带行号显示（\`行号→内容\`，行号仅供参考、不是文件内容，编辑时勿带）。支持 offset/limit 按行读大文件，默认最多 2000 行。优先用本工具而非 bash 的 Get-Content/cat。${outsideHint}`,
     parameters: readFileSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const all = readFileSync(resolveReadPath(workdir, params.path, allowReadOutside), "utf8").split("\n");
       const from = Math.max(1, params.offset ?? 1);
       const max = Math.min(params.limit ?? 2000, 2000);
@@ -73,24 +73,24 @@ export function makeFsTools(workdir: string, allowReadOutside = false): AgentToo
     },
   };
 
-  const listDir: AgentTool<typeof listDirSchema, { entries: number }> = {
+  const listDir: AgentHarnessTool<object | undefined, typeof listDirSchema, { entries: number }> = {
     name: "list_dir",
     label: "列目录",
     description: `列出某个目录的条目（文件 / 子目录）。${outsideHint}`,
     parameters: listDirSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const abs = resolveReadPath(workdir, params.path ?? ".", allowReadOutside);
       const items = readdirSync(abs).map((name) => `${statSync(resolve(abs, name)).isDirectory() ? "d" : "-"} ${name}`);
       return { content: txt(items.join("\n") || "(空目录)"), details: { entries: items.length } };
     },
   };
 
-  const writeFile: AgentTool<typeof writeFileSchema, { path: string; bytes: number; diff: FileDiff }> = {
+  const writeFile: AgentHarnessTool<object | undefined, typeof writeFileSchema, { path: string; bytes: number; diff: FileDiff }> = {
     name: "write_file",
     label: "写入文件",
     description: "把内容写入 workdir 内文件（整文件覆盖）。用于新建文件或整体重写；改动已有文件的局部请优先用 edit_file。写操作会经过权限闸门确认。",
     parameters: writeFileSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const abs = safePath(workdir, params.path);
       const existed = existsSync(abs);
       const before = existed ? readFileSync(abs, "utf8") : "";
@@ -104,13 +104,13 @@ export function makeFsTools(workdir: string, allowReadOutside = false): AgentToo
     },
   };
 
-  const editFile: AgentTool<typeof editFileSchema, { path: string; replacements: number; diff: FileDiff }> = {
+  const editFile: AgentHarnessTool<object | undefined, typeof editFileSchema, { path: string; replacements: number; diff: FileDiff }> = {
     name: "edit_file",
     label: "精准编辑",
     description:
       "对 workdir 内已有文件做精准片段替换：把 old_string 替换为 new_string。old_string 必须与文件内容精确匹配且默认唯一（不唯一时请补足上下文或用 replace_all）。适合改局部而不重写整文件。写操作会经过权限闸门确认。",
     parameters: editFileSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const abs = safePath(workdir, params.path);
       const before = readFileSync(abs, "utf8");
       if (params.old_string === params.new_string) {
@@ -141,5 +141,5 @@ export function makeFsTools(workdir: string, allowReadOutside = false): AgentToo
     },
   };
 
-  return [readFile, listDir, writeFile, editFile] as unknown as AgentTool[];
+  return [readFile, listDir, writeFile, editFile] as unknown as AgentHarnessTool<object | undefined>[];
 }

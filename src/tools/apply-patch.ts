@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import { computeFileDiff, type FileDiff } from "../ui/diff.js";
 
 /**
@@ -98,14 +98,14 @@ function applyUpdate(content: string, body: string[]): string {
   return out;
 }
 
-export function makeApplyPatchTool(workdir: string): AgentTool<typeof patchSchema, { files: number; diffs: FileDiff[] }> {
+export function makeApplyPatchTool(workdir: string): AgentHarnessTool<object | undefined, typeof patchSchema, { files: number; diffs: FileDiff[] }> {
   return {
     name: "apply_patch",
     label: "应用补丁",
     description:
       "应用带上下文的多文件补丁（*** Begin Patch / Update|Add|Delete File / @@ / 空格上下文·-删·+增 / *** End Patch）。改局部、跨多文件首选。写操作经权限闸门。",
     parameters: patchSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const ops = parsePatch(params.patch);
       if (!ops.length) throw new Error("未解析到文件操作（检查 *** Update/Add/Delete File 标记）");
       const summary: string[] = [];

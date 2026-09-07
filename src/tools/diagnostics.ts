@@ -1,9 +1,9 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import type { TextContent } from "@earendil-works/pi-ai";
-import { execSandboxed } from "../sandbox/exec.js";
+import { execSandboxed, signalOf } from "../sandbox/exec.js";
 import { lspLangForPath, type LspClient, type LspDiagnostic } from "../kernel/lsp-client.js";
 
 const txt = (t: string): TextContent[] => [{ type: "text", text: t }];
@@ -30,14 +30,14 @@ const schema = Type.Object({
  *    （类型错误、未定义、未用导入等），近瞬时。**编辑后用它自检最合适。**
  *  · 否则（无 path / 非上述语言 / server 未装）→ 回退跑 `tsc --noEmit` 整项目类型检查。
  */
-export function makeDiagnosticsTool(workdir: string, lsp: LspClient): AgentTool<typeof schema, { ok: boolean; source: string }> {
+export function makeDiagnosticsTool(workdir: string, lsp: LspClient): AgentHarnessTool<object | undefined, typeof schema, { ok: boolean; source: string }> {
   return {
     name: "diagnostics",
     label: "诊断",
     description:
       "检查代码错误/警告（类型、未定义、未用导入等）。给 path → 用 LSP 对单文件做语义诊断（py/ts/tsx/js/jsx），编辑后自检首选；不给 path 或该语言无 LSP → 跑 tsc 整项目检查。只读、不改文件。",
     parameters: schema,
-    execute: async (_id, params, signal) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, context) => {
       // 1) 单文件 LSP 语义诊断
       if (params.path && lspLangForPath(params.path)) {
         const diags = await lsp.diagnostics(params.path);
@@ -54,7 +54,7 @@ export function makeDiagnosticsTool(workdir: string, lsp: LspClient): AgentTool<
           details: { ok: true, source: "none" },
         };
       }
-      const r = await execSandboxed("npx tsc --noEmit", { cwd: workdir, timeoutMs: 180000, maxBytes: 512 * 1024, signal });
+      const r = await execSandboxed("npx tsc --noEmit", { cwd: workdir, timeoutMs: 180000, maxBytes: 512 * 1024, signal: signalOf(context) });
       const ok = r.code === 0 && !r.timedOut;
       return { content: txt(ok ? "✓ 类型检查通过，无错误。" : r.out), details: { ok, source: "tsc" } };
     },

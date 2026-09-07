@@ -24,16 +24,16 @@ const recordsOf = (sink: FakeSink) => sink.lines.map((l) => JSON.parse(l.trimEnd
 
 // ── serializeEvent：硬丢弃 ───────────────────────────────────────────────
 test("serializeEvent：流式增量/冗余事件被硬丢弃（返回 null）", () => {
-  for (const type of ["message_update", "tool_execution_update", "turn_end", "before_provider_payload", "queue_update"]) {
+  for (const type of ["message_update", "tool_update", "turn_end", "before_provider_payload", "queue_update"]) {
     assert.equal(serializeEvent({ type }, { contextFull: false }), null, `${type} 应被丢弃`);
   }
 });
 
-// ── tool_result：完整 verbatim，不截断 ──────────────────────────────────
-test("serializeEvent：tool_result 的 content 完整保留（与 AuditLog 截断相反）", () => {
+// ── tool_end：完整 verbatim，不截断 ─────────────────────────────────────
+test("serializeEvent：tool_end 的 result.content 完整保留（与 AuditLog 截断相反）", () => {
   const big = "x".repeat(5000);
   const rec = serializeEvent(
-    { type: "tool_result", toolName: "read_file", input: { path: "a.ts" }, isError: false, content: [{ type: "text", text: big }] },
+    { type: "tool_end", toolName: "read_file", args: { path: "a.ts" }, isError: false, result: { content: [{ type: "text", text: big }] } },
     { contextFull: false },
   );
   assert.equal(rec?.kind, "tool_result");
@@ -77,29 +77,24 @@ test("serializeEvent：context full 模式整条 dump", () => {
 });
 
 // ── 压缩前后 ──────────────────────────────────────────────────────────────
-test("serializeEvent：session_before_compact 带全量 branchEntries + tokensBefore，丢弃 signal", () => {
-  const ev = {
-    type: "session_before_compact",
-    preparation: { tokensBefore: 12345, fileOps: { read: new Set(["a.ts"]), written: new Set(), edited: new Set(["b.ts"]) } },
-    branchEntries: [{ id: "e1", type: "message" }, { id: "e2", type: "message" }],
-    signal: new AbortController().signal,
-  };
-  const rec = serializeEvent(ev, { contextFull: false });
-  assert.equal(rec?.kind, "compact_before");
-  assert.equal(rec?.tokensBefore, 12345);
-  assert.equal(rec?.branchEntryCount, 2);
-  // 经 safeStringify 后 Set 转数组、signal 被丢弃
-  const round = JSON.parse(safeStringify(rec));
-  assert.deepEqual(round.fileOps.read, ["a.ts"]);
-  assert.deepEqual(round.fileOps.edited, ["b.ts"]);
-  assert.equal("signal" in round, false);
+test("serializeEvent：compaction_start/end 映射压缩前后记录", () => {
+  const start = serializeEvent({ type: "compaction_start", reason: "manual" }, { contextFull: false });
+  assert.equal(start?.kind, "compact_start");
+  assert.equal(start?.reason, "manual");
+  const end = serializeEvent({ type: "compaction_end", reason: "threshold", status: "completed", entryId: "e9" }, { contextFull: false });
+  assert.equal(end?.kind, "compact_after");
+  assert.equal(end?.status, "completed");
+  assert.equal(end?.entryId, "e9");
 });
 
-test("serializeEvent：model_select 把 Model 压成关键标识", () => {
-  const model = { provider: "deepseek", id: "deepseek-v4-pro", contextWindow: 1_000_000, maxTokens: 8192, tokenizer: () => 0 };
-  const rec = serializeEvent({ type: "model_select", source: "set", model, previousModel: undefined }, { contextFull: false });
-  assert.deepEqual(rec?.model, { provider: "deepseek", id: "deepseek-v4-pro", contextWindow: 1_000_000, maxTokens: 8192 });
-  assert.equal(rec?.previousModel, undefined);
+test("serializeEvent：config_update(model) 把模型压成关键标识", () => {
+  const model = { provider: "deepseek", modelId: "deepseek-v4-pro", contextWindow: 1_000_000, maxTokens: 8192, tokenizer: () => 0 };
+  const rec = serializeEvent(
+    { type: "config_update", property: "model", value: model, previous: { provider: "deepseek", modelId: "deepseek-v4-flash" } },
+    { contextFull: false },
+  );
+  assert.deepEqual(rec?.value, { provider: "deepseek", modelId: "deepseek-v4-pro", contextWindow: 1_000_000, maxTokens: 8192 });
+  assert.deepEqual(rec?.previous, { provider: "deepseek", modelId: "deepseek-v4-flash" });
 });
 
 // ── safeStringify：边界 ──────────────────────────────────────────────────
@@ -136,7 +131,7 @@ test("FlightRecorder（summary 模式）：首条 context 全量、后续摘要�
   const ctx = { type: "context", messages: [{ role: "user", content: [] }] };
   rec.handle(ctx); // 首条 → 全量（基线）
   rec.handle(ctx); // 第二条 → 摘要
-  rec.handle({ type: "session_compact", compactionEntry: { summary: "s" } }); // 武装
+  rec.handle({ type: "compaction_end", status: "completed", entryId: "e9" }); // 武装
   rec.handle(ctx); // compact 后第一条 → 全量
   rec.handle(ctx); // 再下一条 → 摘要
   const ctxRecs = recordsOf(sink).filter((r) => r.kind === "context");

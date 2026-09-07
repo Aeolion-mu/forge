@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { truncateForContext } from "../kernel/artifacts.js";
 
@@ -83,13 +83,13 @@ const grepSchema = Type.Object({
   ignoreCase: Type.Optional(Type.Boolean({ description: "忽略大小写，默认 false" })),
 });
 
-export function makeSearchTools(workdir: string, allowReadOutside = false): AgentTool[] {
-  const glob: AgentTool<typeof globSchema, { matches: number }> = {
+export function makeSearchTools(workdir: string, allowReadOutside = false): AgentHarnessTool<object | undefined>[] {
+  const glob: AgentHarnessTool<object | undefined, typeof globSchema, { matches: number }> = {
     name: "glob",
     label: "文件匹配",
     description: "按 glob 模式查找文件（** 跨目录），返回相对路径列表（按修改时间倒序）。自动跳过 node_modules/.git 等。",
     parameters: globSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const root = safeDir(workdir, params.path, allowReadOutside);
       const re = globToRegex(params.pattern);
       const files = walk(root, workdir).filter((f) => re.test(f));
@@ -101,12 +101,12 @@ export function makeSearchTools(workdir: string, allowReadOutside = false): Agen
     },
   };
 
-  const grep: AgentTool<typeof grepSchema, { matches: number; files: number }> = {
+  const grep: AgentHarnessTool<object | undefined, typeof grepSchema, { matches: number; files: number }> = {
     name: "grep",
     label: "内容搜索",
     description: "在文件内容里用正则搜索，返回 路径:行号: 匹配行。可用 glob 限定文件类型。自动跳过二进制/大文件/忽略目录。",
     parameters: grepSchema,
-    execute: async (_id, params) => {
+    execute: async (_id, params, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const root = safeDir(workdir, params.path, allowReadOutside);
       const re = new RegExp(params.pattern, params.ignoreCase ? "i" : undefined);
       const fileGlob = params.glob ? globToRegex(params.glob.includes("/") ? params.glob : `**/${params.glob}`) : undefined;
@@ -142,5 +142,5 @@ export function makeSearchTools(workdir: string, allowReadOutside = false): Agen
     },
   };
 
-  return [glob, grep] as unknown as AgentTool[];
+  return [glob, grep] as unknown as AgentHarnessTool<object | undefined>[];
 }

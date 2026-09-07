@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Box, Text, Static, useApp, useInput } from "ink";
 import { MultilineInput } from "./multiline-input.js";
-import type { AgentHarnessEvent } from "@earendil-works/pi-agent-core";
+import type { HarnessEvent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { renderMarkdown, wrapVisible, contentWidth } from "./markdown.js";
 import { summarizeToolArgs, readFileResultLine } from "./render.js";
@@ -12,7 +12,7 @@ import { createRunQueue } from "./run-queue.js";
 import { ctrlCAction } from "./keybinds.js";
 import { explainApiError } from "../kernel/errors.js";
 
-// 写类工具在 tool_execution_start 显示的动词表头（diff 详情在 end 补上）。
+// 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
 const WRITE_VERB: Record<string, string> = { edit_file: "Update", write_file: "Write" };
 import type { ForgeAgent } from "../kernel/forge-agent.js";
 import type { ForgeConfig } from "../config.js";
@@ -50,7 +50,7 @@ export interface AppBridge {
   /** 后台子 agent 完成 → 作为新一轮喂回主 agent（串行调度，不阻塞）。 */
   resume: (text: string) => void;
   /** Convergent 验收 agent 的事件流：渲染成带 ⟢ 前缀的活动块。 */
-  convergentEvent: (e: AgentHarnessEvent) => void;
+  convergentEvent: (e: HarnessEvent) => void;
 }
 
 export function App({ agent, config, bridge }: { agent: ForgeAgent; config: ForgeConfig; bridge: AppBridge }) {
@@ -109,7 +109,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
 
   // 事件流 → 状态
   useEffect(() => {
-    return agent.subscribe((e: AgentHarnessEvent) => {
+    return agent.subscribe((e: HarnessEvent) => {
       switch (e.type) {
         case "message_start":
           if ((e.message as { role?: string }).role === "assistant") {
@@ -120,7 +120,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
           }
           break;
         case "message_update": {
-          const ev = e.assistantMessageEvent as { type: string; delta?: string };
+          const ev = e.event as { type: string; delta?: string }; // 0.85：delta 字段改名 event
           if (ev.type === "text_delta" && ev.delta) bufRef.current += ev.delta;
           else if (ev.type === "thinking_delta" && ev.delta) thinkRef.current += ev.delta;
           break;
@@ -143,7 +143,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
           setDash({ turns: t.turns, inTok: t.inputTokens, outTok: t.outputTokens, cost: t.costRmb, ctxUsed: agent.contextTokens, cacheHit: t.cacheHitRate() });
           break;
         }
-        case "tool_execution_start": {
+        case "tool_start": {
           const verb = WRITE_VERB[e.toolName];
           const path = (e.args as { path?: string } | undefined)?.path;
           if (verb && path) push(`${ansi.tool("●")} ${ansi.bold(`${verb}(${path})`)}`);
@@ -151,7 +151,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
           else push(`${ansi.tool("●")} ${ansi.bold(e.toolName)}${ansi.dim(`(${summarizeToolArgs(e.toolName, e.args)})`)}`);
           break;
         }
-        case "tool_execution_end": {
+        case "tool_end": {
           const details = (e.result as { details?: { diff?: FileDiff; diffs?: FileDiff[] } } | undefined)?.details;
           // 写类工具成功 → 渲染 Claude-Code 风格 diff（单文件 details.diff / 多文件 details.diffs）
           if (!e.isError && details?.diff) {
@@ -173,13 +173,13 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
           push(`  ${mark} ${ansi.dim(preview)}`);
           break;
         }
-        case "session_compact": {
+        case "compaction_end": {
           // 压缩完成：lastContextTokens 已被 forge-agent 即时回填，刷新仪表盘 ctx + token/成本
           const t = agent.telemetry;
           setDash({ turns: t.turns, inTok: t.inputTokens, outTok: t.outputTokens, cost: t.costRmb, ctxUsed: agent.contextTokens, cacheHit: t.cacheHitRate() });
           break;
         }
-        case "agent_end":
+        case "run_end":
           setBusy(false);
           break;
         default:
@@ -199,10 +199,10 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
       runMain(text);
     };
     // Convergent 活动流：和主 agent 一样实时展示，但每行加 ⟢ 前缀区分（amber）。
-    bridge.convergentEvent = (e: AgentHarnessEvent) => {
+    bridge.convergentEvent = (e: HarnessEvent) => {
       switch (e.type) {
         case "message_update": {
-          const ev = e.assistantMessageEvent as { type: string; delta?: string };
+          const ev = e.event as { type: string; delta?: string }; // 0.85：delta 字段改名 event
           if (ev.type === "text_delta" && ev.delta) convBufRef.current += ev.delta;
           break;
         }
@@ -213,10 +213,10 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
             convBufRef.current = "";
           }
           break;
-        case "tool_execution_start":
+        case "tool_start":
           push(`${ansi.amber("⟢")} ${ansi.bold(e.toolName)}${ansi.dim(`(${summarizeToolArgs(e.toolName, e.args)})`)}`);
           break;
-        case "tool_execution_end": {
+        case "tool_end": {
           const preview = String((e.result?.content?.[0] as { text?: string } | undefined)?.text ?? "").split("\n")[0].slice(0, 80);
           push(`  ${e.isError ? ansi.error("✗") : ansi.dim("⎿")} ${ansi.dim(preview)}`);
           break;

@@ -52,14 +52,13 @@ type RawEvent = { type: string; [key: string]: unknown };
 /** 流式增量 / 大而冗余 / 低价值的事件：硬丢弃（防 message_update 逐 token 刷屏、payload 全量每轮致二次膨胀）。 */
 const HARD_SKIP = new Set([
   "turn_start",
-  "turn_end", // 等价于 message_end + tool_result，去重
+  "turn_end", // 等价于 message_end + tool_end，去重
   "message_start",
   "message_update", // 逐 token 增量
-  "tool_execution_start",
-  "tool_execution_update",
-  "tool_execution_end", // 与 tool_call / tool_result 重复
-  "before_provider_request", // 巨大的 Model 对象，低价值
-  "before_provider_payload", // 整个 messages 每轮 = 二次膨胀
+  "tool_update", // 中间态部分结果
+  "entry_added", // 与 message_end 重复
+  "before_provider_request", // 巨大的 Model 对象，低价值（0.85 已是 hook，防御性保留）
+  "before_provider_payload", // 整个 messages 每轮 = 二次膨胀（0.85 已是 hook，防御性保留）
   "queue_update",
   "save_point",
   "settled",
@@ -112,11 +111,16 @@ function safeTokens(messages: unknown[]): number {
   }
 }
 
-type ModelLike = { provider?: string; id?: string; contextWindow?: number; maxTokens?: number } | undefined;
-/** Model 对象巨大（含 tokenizer 等），只留关键标识。 */
+type ModelLike = { provider?: string; id?: string; modelId?: string; contextWindow?: number; maxTokens?: number } | undefined;
+/** Model 对象巨大（含 tokenizer 等），只留关键标识；兼容 config_update 里的 ModelIdentity。 */
 function modelBrief(m: ModelLike): Record<string, unknown> | undefined {
-  if (!m) return undefined;
-  return { provider: m.provider, id: m.id, contextWindow: m.contextWindow, maxTokens: m.maxTokens };
+  if (!m || typeof m !== "object") return undefined;
+  const out: Record<string, unknown> = { provider: m.provider };
+  if (m.id !== undefined) out.id = m.id;
+  if (m.modelId !== undefined) out.modelId = m.modelId;
+  if (m.contextWindow !== undefined) out.contextWindow = m.contextWindow;
+  if (m.maxTokens !== undefined) out.maxTokens = m.maxTokens;
+  return out;
 }
 
 /**
@@ -128,83 +132,76 @@ export function serializeEvent(event: RawEvent, opts: { contextFull: boolean }):
   if (HARD_SKIP.has(type)) return null;
 
   switch (type) {
-    case "before_agent_start": {
-      const e = event as { prompt?: string; images?: unknown[]; systemPrompt?: string; resources?: { skills?: { name?: string }[] } };
-      return {
-        kind: "user_input",
-        prompt: e.prompt,
-        images: e.images?.length ?? 0,
-        systemPromptChars: e.systemPrompt?.length ?? 0,
-        skills: (e.resources?.skills ?? []).map((s) => s.name),
-      };
+    case "run_start": {
+      // 0.85 的 run_start 只有 runId/时间戳；user_input（prompt + systemPromptChars）改由
+      // forge-agent 在 run() 里手动 record（before_run 钩子数据不在事件流里）。
+      const e = event as { runId?: string };
+      return { kind: "agent_start", runId: e.runId };
+    }
+    case "run_end": {
+      const e = event as { runId?: string; status?: string; error?: unknown };
+      return { kind: "agent_end", runId: e.runId, status: e.status, error: e.error };
     }
     case "message_end": {
       // 模型完整回复（thinking + text + tool_use blocks），verbatim
       return { kind: "model_reply", message: (event as { message?: unknown }).message };
     }
-    case "tool_call": {
-      const e = event as { toolCallId?: string; toolName?: string; input?: unknown };
-      return { kind: "tool_call", toolCallId: e.toolCallId, toolName: e.toolName, input: e.input };
+    case "tool_start": {
+      const e = event as { toolCallId?: string; toolName?: string; args?: unknown };
+      return { kind: "tool_call", toolCallId: e.toolCallId, toolName: e.toolName, input: e.args };
     }
-    case "tool_result": {
+    case "tool_end": {
       // content / details 完整 verbatim（与 AuditLog 的 300 字截断相反——这正是飞行记录的价值）
-      const e = event as { toolCallId?: string; toolName?: string; input?: unknown; content?: unknown; isError?: boolean; details?: unknown };
+      const e = event as { toolCallId?: string; toolName?: string; args?: unknown; result?: { content?: unknown; details?: unknown }; isError?: boolean };
       return {
         kind: "tool_result",
         toolCallId: e.toolCallId,
         toolName: e.toolName,
-        input: e.input,
+        input: e.args,
         isError: e.isError,
-        content: e.content,
-        details: e.details,
+        content: e.result?.content,
+        details: e.result?.details,
       };
     }
     case "context": {
+      // 0.85 没有 context 事件：forge-agent 把 transform_context 钩子（每次 LLM 调用的完整
+      // messages + systemPrompt）手动喂进来，沿用此 case 与「压缩后整条 dump」状态机。
       const raw = (event as { messages?: unknown[] }).messages;
       const messages = Array.isArray(raw) ? raw : [];
-      const base = { kind: "context", tokens: safeTokens(messages), ...summarizeContextMessages(messages as { role?: string }[]) };
+      const sp = (event as { systemPrompt?: string }).systemPrompt;
+      const base = {
+        kind: "context",
+        tokens: safeTokens(messages),
+        systemPromptChars: typeof sp === "string" ? sp.length : 0,
+        ...summarizeContextMessages(messages as { role?: string }[]),
+      };
       return opts.contextFull ? { ...base, full: true, messagesFull: messages } : { ...base, full: false };
     }
-    case "session_before_compact": {
-      // 压缩前全量快照：branchEntries = 压缩前完整会话树分支
-      const e = event as { preparation?: { tokensBefore?: number; fileOps?: unknown }; branchEntries?: unknown[]; customInstructions?: string };
+    case "compaction_start": {
+      const e = event as { reason?: string };
+      return { kind: "compact_start", reason: e.reason };
+    }
+    case "compaction_end": {
+      // 压缩后：entryId 指向产出的 compaction entry（摘要本体经 forge 的 compact_detail 记录）
+      const e = event as { status?: string; entryId?: string; reason?: string };
+      return { kind: "compact_after", status: e.status, entryId: e.entryId, reason: e.reason };
+    }
+    case "config_update": {
+      // 0.85 把 model/thinkingLevel/tools/resources/streamOptions 等配置变更统一成 config_update
+      const e = event as { property?: string; value?: unknown; previous?: unknown };
       return {
-        kind: "compact_before",
-        tokensBefore: e.preparation?.tokensBefore,
-        branchEntryCount: Array.isArray(e.branchEntries) ? e.branchEntries.length : 0,
-        fileOps: e.preparation?.fileOps,
-        customInstructions: e.customInstructions,
-        branchEntries: e.branchEntries,
+        kind: "config_update",
+        property: e.property,
+        value: modelBrief(e.value as ModelLike) ?? e.value,
+        previous: modelBrief(e.previous as ModelLike) ?? e.previous,
       };
     }
-    case "session_compact": {
-      // 压缩后：compactionEntry 含产出的摘要
-      const e = event as { compactionEntry?: unknown; fromHook?: boolean };
-      return { kind: "compact_after", fromHook: e.fromHook, compactionEntry: e.compactionEntry };
-    }
-    case "model_select": {
-      const e = event as { model?: ModelLike; previousModel?: ModelLike; source?: string };
-      return { kind: "model_select", source: e.source, model: modelBrief(e.model), previousModel: modelBrief(e.previousModel) };
-    }
-    case "thinking_level_select": {
-      const e = event as { level?: string; previousLevel?: string };
-      return { kind: "thinking_level_select", level: e.level, previousLevel: e.previousLevel };
-    }
-    case "agent_start":
-      return { kind: "agent_start" };
-    case "agent_end": {
-      const msgs = (event as { messages?: unknown[] }).messages;
-      return { kind: "agent_end", messageCount: Array.isArray(msgs) ? msgs.length : 0 };
-    }
-    case "after_provider_response":
-      return { kind: "provider_response", status: (event as { status?: number }).status };
-    case "abort":
+    case "operation_abort":
       return { kind: "abort" };
-    case "resources_update":
-      return { kind: "resources_update" };
-    case "session_tree": {
-      const e = event as { newLeafId?: string | null; oldLeafId?: string | null };
-      return { kind: "session_tree", newLeafId: e.newLeafId, oldLeafId: e.oldLeafId };
+    case "navigation_end": {
+      // 旧 session_tree 的等价物：树上移动后的 fromTipId/tipId
+      const e = event as { fromTipId?: string | null; tipId?: string | null; status?: string };
+      return { kind: "session_tree", newLeafId: e.tipId, oldLeafId: e.fromTipId, status: e.status };
     }
     default:
       // 未知/新增类型：留个轻量时间线标记，不丢
@@ -214,8 +211,8 @@ export function serializeEvent(event: RawEvent, opts: { contextFull: boolean }):
 
 /** 带标签的子流监听器（子 agent / Convergent 各一个，独立 context 状态机，共享 sink + seq）。 */
 export interface FlightScope {
-  /** 作为某个 harness.subscribe 的监听器。 */
-  handle: (event: { type: string }) => void;
+  /** 作为某个事件流的监听器（也接收 forge 手动合成的 context 事件）。 */
+  handle: (event: RawEvent) => void;
 }
 
 export class FlightRecorder {
@@ -249,20 +246,20 @@ export class FlightRecorder {
    */
   scope(agent: string): FlightScope {
     let dumpNextContextFull = true; // 该子流首条 context = 基线全量
-    const handle = (event: { type: string }): void => {
-      const e = event as RawEvent;
+    const handle = (event: RawEvent): void => {
+      const e = event;
       let contextFull = this.contextMode === "full";
       if (e.type === "context" && dumpNextContextFull) contextFull = true;
       const data = serializeEvent(e, { contextFull });
       if (e.type === "context") dumpNextContextFull = false; // 一次性 full 用掉
-      else if (e.type === "session_compact") dumpNextContextFull = true; // compact 后重新武装
+      else if (e.type === "compaction_end") dumpNextContextFull = true; // compact 后重新武装
       if (data) this.emit(agent, data);
     };
     return { handle };
   }
 
-  /** 作为主 harness.subscribe 的监听器（只读观察，不干预 harness）。 */
-  handle = (event: { type: string }): void => this.mainScope.handle(event);
+  /** 作为主事件流的监听器（只读观察，不干预 harness；也接收手动合成的 context 事件）。 */
+  handle = (event: RawEvent): void => this.mainScope.handle(event);
 
   /** 显式记录里程碑（如 compact_detail 的压缩前后对比、session_start），归到主流。 */
   record(kind: string, data: Record<string, unknown> = {}): void {

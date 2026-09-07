@@ -55,6 +55,14 @@ export function setSandboxPolicy(p: SandboxPolicy | null): void {
   activePolicy = p;
 }
 
+/**
+ * 从 0.85 的库 Context 里取取消信号（工具六参签名里 signal 没了，取消走 context）。
+ * Context 来自 @earendil-works/chord，abortSignal 可能不存在。
+ */
+export function signalOf(context: { abortSignal?: AbortSignal | undefined } | undefined): AbortSignal | undefined {
+  return context?.abortSignal;
+}
+
 /** 在受限子进程里执行一条命令（shell-string，经 /bin/sh；Linux 上再叠 bwrap 硬沙箱）。 */
 export function execSandboxed(cmd: string, opts: SandboxExecOptions): Promise<SandboxExecResult> {
   const spawnOpts = { cwd: opts.cwd, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes, env: scrubbedEnv(), signal: opts.signal };

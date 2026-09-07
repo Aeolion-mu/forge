@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { resolveReadPath } from "./fs-tools.js";
 import { computeFileDiff, type FileDiff } from "../ui/diff.js";
@@ -62,18 +62,18 @@ const UNAVAILABLE = "LSP 未就绪（该语言无 server 或未安装，仅 py/t
  * LSP 语义工具：definition / references / hover，按**符号名**查询（先在文件里定位符号位置，
  * 再交 language server 做跨文件语义解析）。比 grep 准、跨文件。server 缺失则提示并建议回退。
  */
-export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside = false): AgentTool[] {
+export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside = false): AgentHarnessTool<object | undefined>[] {
   const locate = (path: string, symbol: string, line?: number) => {
     const abs = resolveReadPath(workdir, path, allowReadOutside);
     return locateSymbol(readFileSync(abs, "utf8"), symbol, line);
   };
 
-  const references: AgentTool<typeof symSchema, { found: boolean; count: number }> = {
+  const references: AgentHarnessTool<object | undefined, typeof symSchema, { found: boolean; count: number }> = {
     name: "references",
     label: "查引用",
     description: "用 LSP 找一个符号在全工程的所有引用（跨文件，比 grep 准）。支持 py/ts/tsx/js/jsx。",
     parameters: symSchema,
-    execute: async (_id, p) => {
+    execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       if (!lspLangForPath(p.path)) return { content: txt(UNAVAILABLE), details: { found: false, count: 0 } };
       const pos = locate(p.path, p.symbol, p.line);
       if (!pos) return { content: txt(`未在 ${p.path} 找到符号 ${p.symbol}`), details: { found: false, count: 0 } };
@@ -84,12 +84,12 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     },
   };
 
-  const definition: AgentTool<typeof symSchema, { found: boolean; count: number }> = {
+  const definition: AgentHarnessTool<object | undefined, typeof symSchema, { found: boolean; count: number }> = {
     name: "definition",
     label: "查定义",
     description: "用 LSP 跳到符号的定义处（跨文件，比 grep 准）。给出符号在某文件的使用处，返回其定义位置。支持 py/ts/tsx/js/jsx。",
     parameters: symSchema,
-    execute: async (_id, p) => {
+    execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       if (!lspLangForPath(p.path)) return { content: txt(UNAVAILABLE), details: { found: false, count: 0 } };
       const pos = locate(p.path, p.symbol, p.line);
       if (!pos) return { content: txt(`未在 ${p.path} 找到符号 ${p.symbol}`), details: { found: false, count: 0 } };
@@ -100,12 +100,12 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     },
   };
 
-  const hover: AgentTool<typeof symSchema, { found: boolean }> = {
+  const hover: AgentHarnessTool<object | undefined, typeof symSchema, { found: boolean }> = {
     name: "hover",
     label: "查类型/文档",
     description: "用 LSP 取符号的类型签名 / 文档（hover）。支持 py/ts/tsx/js/jsx。",
     parameters: symSchema,
-    execute: async (_id, p) => {
+    execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       if (!lspLangForPath(p.path)) return { content: txt(UNAVAILABLE), details: { found: false } };
       const pos = locate(p.path, p.symbol, p.line);
       if (!pos) return { content: txt(`未在 ${p.path} 找到符号 ${p.symbol}`), details: { found: false } };
@@ -122,13 +122,13 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     line: Type.Optional(Type.Number({ description: "符号所在行号（1-based）消歧，缺省取首个匹配" })),
   });
 
-  const rename: AgentTool<typeof renameSchema, { found: boolean; files: number; diffs: FileDiff[] }> = {
+  const rename: AgentHarnessTool<object | undefined, typeof renameSchema, { found: boolean; files: number; diffs: FileDiff[] }> = {
     name: "rename",
     label: "重命名符号",
     description:
       "用 LSP 跨全工程重命名一个符号（函数/类/变量）并同步所有引用，比手工改安全。支持 py/ts/tsx/js/jsx。写操作经权限闸门。",
     parameters: renameSchema,
-    execute: async (_id, p) => {
+    execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const args = p as { path: string; symbol: string; newName: string; line?: number };
       if (!lspLangForPath(args.path)) return { content: txt(UNAVAILABLE), details: { found: false, files: 0, diffs: [] } };
       const pos = locate(args.path, args.symbol, args.line);
@@ -154,5 +154,5 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     },
   };
 
-  return [definition, references, hover, rename] as unknown as AgentTool[];
+  return [definition, references, hover, rename] as unknown as AgentHarnessTool<object | undefined>[];
 }

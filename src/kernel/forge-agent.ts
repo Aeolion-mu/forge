@@ -4,21 +4,31 @@ import {
   formatSkillsForSystemPrompt,
   calculateContextTokens,
   loadSkills,
+  TODO_CONTEXT,
+  withAbortSignal,
 } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type {
-  AgentHarnessEvent,
-  AgentTool,
+  AgentLane,
+  AgentHarnessTool,
   CompactionEntry,
+  Context,
+  Entry,
+  Events,
+  HarnessEvent,
+  HarnessEventType,
   JsonlSessionMetadata,
+  MessageEntry,
   Session,
-  SessionTreeEntry,
   Skill,
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { completeSimple, getEnvApiKey } from "@earendil-works/pi-ai";
+// 0.85 起 pi-ai 根入口不再导出这些函数；/compat 是官方临时 shim（签名不变）。
+import { completeSimple, getEnvApiKey } from "@earendil-works/pi-ai/compat";
 import type { Api, AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import { hasKey, resolveModel, type ForgeConfig, type ModelEntry } from "../config.js";
+import { getModels } from "./models.js";
+import { subscribeHarness } from "./events.js";
 import { AuditLog } from "./audit.js";
 import {
   estimateTokens,
@@ -129,7 +139,7 @@ export interface ForgeAgentOptions {
   /** 后台子 agent 完成时，把结论作为新一轮喂回主 agent（不阻塞主循环）。 */
   onResume?: (text: string) => void;
   /** Convergent 验收 agent 的事件流：让它的活动像主 agent 一样实时显示（UI 加前缀区分）。 */
-  onConvergentEvent?: (e: AgentHarnessEvent) => void;
+  onConvergentEvent?: (e: HarnessEvent) => void;
 }
 
 /** 从一条 assistant 消息里取纯文本。 */
@@ -141,6 +151,19 @@ function textOf(msg: AssistantMessage | undefined): string {
     .join("")
     .trim();
   return t || "(no text output)";
+}
+
+/**
+ * 自研压缩 cut point（firstKeptEntryId）之后的全部消息 —— 0.85 起压缩结果必须给
+ * `retainedTail`（存进 compaction entry 的「保留近端消息」），替代旧的 firstKeptEntryId 字段。
+ */
+function tailMessagesFrom(entries: Entry[], firstKeptEntryId: string): Message[] {
+  const idx = entries.findIndex((e) => e.id === firstKeptEntryId);
+  if (idx === -1) return [];
+  return entries
+    .slice(idx)
+    .filter((e): e is MessageEntry => e.type === "message")
+    .map((e) => e.message as Message);
 }
 
 /** 安全序列化 tool_call 参数为文本（循环引用等异常兜底为 String）。空/undefined → ""。 */
@@ -203,7 +226,7 @@ export function editedPaths(e: { toolName: string; input?: Record<string, unknow
 }
 
 /** 把会话树 entries 投影成 compaction 模块的 PlanEntry[]（不把库类型泄漏进 compaction.ts）。导出供测试。 */
-export function toPlanEntries(entries: SessionTreeEntry[]): PlanEntry[] {
+export function toPlanEntries(entries: Entry[]): PlanEntry[] {
   return entries.map((e) => {
     if (e.type === "message") return { id: e.id, type: "message", role: (e.message as Message).role, text: textOfMessage(e.message as Message) };
     if (e.type === "compaction") return { id: e.id, type: "compaction", summary: (e as CompactionEntry).summary };
@@ -233,14 +256,27 @@ export class ForgeAgent {
   /** 本次运行的飞行日志文件路径（关闭时 null）。 */
   private readonly flightPath: string | null;
   private readonly harness: AgentHarness;
+  /** 0.85 起 run 方法（prompt/steer/abort/compact/setModel…）都在 lane 上。 */
+  private readonly lane: AgentLane;
+  /** 库 Context 线程化的根 context（TODO_CONTEXT 够用：forge 不依赖 context 传值）。 */
+  private readonly ctx: Context = TODO_CONTEXT;
+  private readonly session: Session;
+  /** 已加载 skills（旧 harness.getResources() 变异步后改自持）。 */
+  private readonly skills: Skill[];
   private readonly policy: PermissionPolicy;
   private readonly env: NodeExecutionEnv;
   private readonly repo: JsonlSessionRepo;
   private live: boolean;
   private currentRef: string;
+  /** 当前模型对象（旧 harness.getModel() 同步取；0.85 变异步，改为自持并随 switchModel 更新）。 */
+  private currentModel: Model<Api>;
+  /** 最近一轮 assistant 文本（0.85 的 prompt() 返回 RunResult 不带消息，改从 turn_end 事件取）。 */
+  private lastAssistantText = "";
   private lastContextTokens = 0;
-  /** 压缩进行中暂存的 branch（session_before_compact 写入），压缩完成后据实际保留点重算用量。 */
+  /** 压缩进行中暂存的 branch（before_compaction 写入），供压缩后重算与 retainedTail 构造。 */
   private pendingBranchPlan?: PlanEntry[];
+  /** 最近一次自研压缩的结果快照（before_compaction 暂存；lane.compact() 返回值不再带 summary）。 */
+  private lastCompactResult?: { summary: string; tokensBefore: number; keptTokens: number; firstKeptEntryId: string };
   /** 压缩连续失败计数 + 熔断标志（连续 3 次失败停用自动压缩，防空烧 API）。 */
   private compactionFailures = 0;
   private compactionDisabled = false;
@@ -265,7 +301,7 @@ export class ForgeAgent {
   private constructor(
     private readonly config: ForgeConfig,
     private readonly opts: ForgeAgentOptions,
-    deps: { harness: AgentHarness; env: NodeExecutionEnv; repo: JsonlSessionRepo; lsp: LspClient; flight: FlightRecorder | null; flightPath: string | null },
+    deps: { harness: AgentHarness; lane: AgentLane; session: Session; skills: Skill[]; env: NodeExecutionEnv; repo: JsonlSessionRepo; lsp: LspClient; flight: FlightRecorder | null; flightPath: string | null },
   ) {
     this.telemetry = new Telemetry(config.pricing);
     this.subTelemetry = new Telemetry(config.pricing);
@@ -275,7 +311,11 @@ export class ForgeAgent {
     this.policy = new PermissionPolicy({ autoApprove: opts.autoApprove, workdir: config.workdir, allowWriteOutside: config.allowWriteOutside });
     this.live = config.live;
     this.currentRef = config.modelRef;
+    this.currentModel = config.model;
     this.harness = deps.harness;
+    this.lane = deps.lane;
+    this.session = deps.session;
+    this.skills = deps.skills;
     this.env = deps.env;
     this.repo = deps.repo;
     this.lsp = deps.lsp;
@@ -286,25 +326,25 @@ export class ForgeAgent {
       onError: (role, message) => this.audit.write({ kind: "tool_end", tool: "spawn_subagent", isError: true, preview: `[${role}] ${message}` }),
     });
 
-    // 权限闸门 + 审计开始（emitHook 取最后一个非 undefined 返回，故权限决策放这一个 handler）
-    this.harness.on("tool_call", async (e) => {
-      const decision = this.policy.check(e.toolName, e.input);
-      this.audit.write({ kind: "permission", tool: e.toolName, args: e.input, verdict: decision.verdict, reason: decision.reason });
-      if (decision.verdict === "deny") return { block: true, reason: decision.reason };
+    // 权限闸门 + 审计开始（0.85：before_tool 钩子，deny 形状 {block:{reason}}）
+    this.harness.hooks.on("before_tool", async (e) => {
+      const decision = this.policy.check(e.toolName, e.args);
+      this.audit.write({ kind: "permission", tool: e.toolName, args: e.args, verdict: decision.verdict, reason: decision.reason });
+      if (decision.verdict === "deny") return { block: { reason: decision.reason } };
       if (decision.verdict === "review") {
-        const g = await this.runWriteGuard(String((e.input as { cmd?: unknown })?.cmd ?? ""), this.currentUserInstruction);
+        const g = await this.runWriteGuard(String((e.args as { cmd?: unknown })?.cmd ?? ""), this.currentUserInstruction);
         if (g) return g; // {block} 才拦；放行返回 undefined 继续后续流程
       }
       if (decision.verdict === "confirm" && this.opts.confirm) {
-        const ok = await this.opts.confirm(e.toolName, e.input);
-        if (!ok) return { block: true, reason: "用户拒绝了该操作" };
+        const ok = await this.opts.confirm(e.toolName, e.args);
+        if (!ok) return { block: { reason: "用户拒绝了该操作" } };
       }
-      this.audit.write({ kind: "tool_start", tool: e.toolName, args: e.input });
+      this.audit.write({ kind: "tool_start", tool: e.toolName, args: e.args });
       return undefined;
     });
 
-    // 审计结束
-    this.harness.on("tool_result", async (e) => {
+    // 审计结束（after_tool：可改写结果内容 —— 编辑后自动诊断的注记就走这里）
+    this.harness.hooks.on("after_tool", async (e) => {
       const preview = String((e.content?.[0] as { text?: string } | undefined)?.text ?? "");
       this.audit.write({ kind: "tool_end", tool: e.toolName, isError: e.isError, preview });
       // converge 目标进行中：累计改动文件路径（喂给 Convergent 的证据清单）。
@@ -328,27 +368,31 @@ export class ForgeAgent {
     });
 
     // 上下文用量（供压缩触发判定 + 仪表盘）取自「最近一轮 assistant 的真实 provider usage」，
-    // 在 turn 完成后记录。**不要**用压缩前的 context 钩子估算：estimateContextTokens 把用量锚定在
+    // 在 turn 完成后记录。**不要**用压缩前的估算：estimateContextTokens 把用量锚定在
     // 最后一条带 usage 的 assistant 上，而压缩后保留窗口里残留的旧 assistant 记的是压缩前满窗 usage，
     // 会让用量虚高不降、每发一条消息都重复触发压缩（已修 bug）。turn_end 的 usage 在压缩后自然变小。
-    this.harness.subscribe((e) => {
+    // 同处顺带记录最近 assistant 文本（0.85 的 prompt() 返回 RunResult，不再携带最终消息）。
+    subscribeHarness(this.harness.events, (e) => {
       if (e.type !== "turn_end") return;
       const usage = (e as { message?: AssistantMessage }).message?.usage;
       if (usage) {
         const t = calculateContextTokens(usage);
         if (t > 0) this.lastContextTokens = t;
       }
+      this.lastAssistantText = textOf((e as { message?: AssistantMessage }).message);
     });
 
-    // 自研完整压缩接管：库只给 compact() 原语 + session_before_compact 钩子，
+    // 自研完整压缩接管：库只给 compact() 原语 + before_compaction 钩子，
     // 我们用自己的 cut point（留 20% 窗口）+ 9 段摘要 + map-reduce 兜底产出结果，
     // 库负责把它落进会话树。返回 undefined 则回退库默认压缩。
-    this.harness.on("session_before_compact", async (e) => {
+    // 注意：compaction.enabled=false 只关掉库的阈值自动触发（虚拟窗口必须由 forge 的
+    // maybeCompact 用 effectiveWindow 判定），手动 lane.compact() 不受影响。
+    this.harness.hooks.on("before_compaction", async (e, context) => {
       try {
         this.status("Analyzing conversation…");
-        // 暂存本次 branch（含 entry id + 文本）：压缩完成后据实际 firstKeptEntryId 重算保留窗口、
-        // 即时刷新上下文用量——无论走自研摘要还是回退库默认压缩都成立。
-        this.pendingBranchPlan = toPlanEntries(e.branchEntries);
+        // 暂存本次 branch（含 entry id + 文本）：0.85 的事件不再带 branchEntries，自查 lane。
+        const entries = await this.lane.findEntries(undefined, context);
+        this.pendingBranchPlan = toPlanEntries(entries);
         const plan = extractCompactionPlan(this.pendingBranchPlan, Math.floor(0.2 * this.effectiveWindow));
         if (!plan) return undefined; // 没有可压缩前缀 → 让库默认处理
         this.status("Summarizing (calling model)…");
@@ -370,37 +414,50 @@ export class ForgeAgent {
           messagesToSummarize: plan.messagesToSummarize,
           firstKeptEntryId: plan.firstKeptEntryId,
         });
-        const fileOps = (e.preparation as { fileOps?: { read: Set<string>; written: Set<string>; edited: Set<string> } }).fileOps;
+        const fileOps = e.preparation.fileOps as { read: Set<string>; written: Set<string>; edited: Set<string> } | undefined;
         const details = fileOps
           ? { readFiles: [...fileOps.read], modifiedFiles: [...new Set([...fileOps.written, ...fileOps.edited])] }
           : undefined;
-        return { compaction: { summary, firstKeptEntryId: plan.firstKeptEntryId, tokensBefore: e.preparation.tokensBefore, details } };
+        // 暂存快照：lane.compact() 的返回值不再带 summary/firstKeptEntryId，压缩后重算用量靠它。
+        this.lastCompactResult = { summary, tokensBefore: e.preparation.tokensBefore, keptTokens: plan.keptTokens, firstKeptEntryId: plan.firstKeptEntryId };
+        // 0.85 起压缩结果用 retainedTail（存进 compaction entry 的保留近端消息）表达保留窗口。
+        return { compaction: { summary, retainedTail: tailMessagesFrom(entries, plan.firstKeptEntryId), tokensBefore: e.preparation.tokensBefore, details } };
       } catch (err) {
-        if (this.currentAbort?.signal.aborted) return { cancel: true }; // 用户 Ctrl+C → 取消压缩，不回退库默认（避免再发一次 LLM）
+        if (this.currentAbort?.signal.aborted) return { decline: true }; // 用户 Ctrl+C → 取消压缩，不回退库默认（避免再发一次 LLM）
         this.audit.write({ kind: "tool_end", tool: "compact", isError: true, preview: (err as Error).message });
         return undefined; // 自研路径失败 → 回退库默认压缩
       }
     });
 
-    this.harness.subscribe(this.telemetry.handle);
+    // 0.85 没有 context 事件：用 transform_context 钩子（每次 LLM 调用前组装好的完整
+    // messages + systemPrompt）喂飞行记录仪的 context 管线（增量摘要 / 压缩后整条 dump 状态机照旧）。
+    if (this.flight) {
+      this.harness.hooks.on("transform_context", (e) => {
+        this.flight?.handle({ type: "context", messages: e.messages, systemPrompt: e.systemPrompt });
+        return undefined; // 只观察不改写
+      });
+    }
+
+    subscribeHarness(this.harness.events, this.telemetry.handle);
     // 飞行记录仪：订阅完整事件流，逐条全量落盘（只读观察，不干预 harness）。
-    if (this.flight) this.harness.subscribe(this.flight.handle);
+    if (this.flight) subscribeHarness(this.harness.events, this.flight.handle);
     if (opts.render !== false) {
-      this.harness.subscribe(makeRenderer());
+      subscribeHarness(this.harness.events, makeRenderer());
     }
   }
 
   /** 异步工厂：构造 env / session / skills / harness（构造函数不能 async）。 */
   static async create(config: ForgeConfig, opts: ForgeAgentOptions = {}): Promise<ForgeAgent> {
+    const ctx = TODO_CONTEXT;
     const env = new NodeExecutionEnv({ cwd: config.workdir });
-    const repo = new JsonlSessionRepo({ fs: env, sessionsRoot: config.sessionsDir });
-    const session: Session = opts.resume ? await repo.open(opts.resume) : await repo.create({ cwd: config.workdir });
+    const repo = new JsonlSessionRepo({ fileSystem: env, sessionsRoot: config.sessionsDir });
+    const session: Session = opts.resume ? await repo.open(opts.resume, ctx) : await repo.create({ cwd: config.workdir }, ctx);
 
     // 飞行记录仪：每次运行一个文件 <ts>-<sessionId>.jsonl（默认开）。
     let flight: FlightRecorder | null = null;
     let flightPath: string | null = null;
     if (config.flightLog.enabled) {
-      const meta = await session.getMetadata();
+      const meta = session.metadata; // 0.85：同步属性，替代旧 getMetadata()
       const ts = new Date().toISOString().replace(/[:.]/g, "-");
       flightPath = resolve(config.flightLog.dir, `${ts}-${meta.id}.jsonl`);
       flight = new FlightRecorder(new FileFlightSink(flightPath), { contextMode: config.flightLog.contextMode });
@@ -414,14 +471,14 @@ export class ForgeAgent {
     }
 
     const memory = new Memory(config.workdir);
-    const { skills } = await loadSkills(env, config.skillsDirs);
+    const { skills } = await loadSkills(env, config.skillsDirs, ctx);
     const lsp = new LspClient(config.workdir); // 惰性：构造不 spawn，首次查询才起 server
 
     // 进程级注入沙箱策略：之后所有 execSandboxed（bash/diagnostics）在 Linux+bwrap 上自动受管。
     setSandboxPolicy(config.sandbox);
 
     let self!: ForgeAgent;
-    const tools: AgentTool[] = [
+    const tools: AgentHarnessTool<object | undefined>[] = [
       ...makeFsTools(config.workdir, config.allowReadOutsideWorkdir),
       ...makeSearchTools(config.workdir, config.allowReadOutsideWorkdir),
       makeOutlineTool(config.workdir, config.allowReadOutsideWorkdir),
@@ -442,38 +499,39 @@ export class ForgeAgent {
       makeSshTool(config.ssh),
     ];
 
-    const harness = new AgentHarness({
-      env,
-      session,
-      tools,
-      resources: { skills },
-      model: config.model,
-      streamOptions: streamOptionsOf(config), // 单请求退避重试（OpenAI SDK 内置）
-      thinkingLevel: config.thinkingLevel, // reasoning 拉满（DeepSeek → reasoning_effort:max）
-      steeringMode: "all", // 忙时插话：当前 turn 边界一次性注入全部排队消息（库默认 one-at-a-time 会分多 turn 喂）
-      systemPrompt: ({ resources }) => {
-        const parts = [MAIN_SYSTEM_PROMPT, environmentBlock(config.workdir)];
-        const sk = resources.skills ?? [];
-        if (sk.length) parts.push(formatSkillsForSystemPrompt(sk));
-        const memIndex = memory.indexBlock(); // 常驻注入记忆索引（具体记忆按需 memory_read）
-        if (memIndex) parts.push(memIndex);
-        return parts.join("\n\n");
+    // 0.85：异步工厂 create()；env/auth 选项没了（auth 归 Models），models 必填。
+    const { harness } = await AgentHarness.create(
+      {
+        session,
+        models: getModels(), // 全部内置 provider + env key 解析（见 kernel/models.ts）
+        tools,
+        resources: { skills },
+        model: config.model,
+        streamOptions: streamOptionsOf(config), // 单请求退避重试（OpenAI SDK 内置）
+        thinkingLevel: config.thinkingLevel, // reasoning 拉满（DeepSeek → reasoning_effort:max）
+        steeringMode: "all", // 忙时插话：当前 turn 边界一次性注入全部排队消息（库默认 one-at-a-time 会分多 turn 喂）
+        compaction: { ...config.compaction, enabled: false }, // 关库内置阈值触发（虚拟窗口由 forge maybeCompact 管）；手动 compact 不受影响
+        systemPrompt: () => {
+          const parts = [MAIN_SYSTEM_PROMPT, environmentBlock(config.workdir)];
+          if (skills.length) parts.push(formatSkillsForSystemPrompt(skills));
+          const memIndex = memory.indexBlock(); // 常驻注入记忆索引（具体记忆按需 memory_read）
+          if (memIndex) parts.push(memIndex);
+          return parts.join("\n\n");
+        },
       },
-      getApiKeyAndHeaders: async (model: Model<Api>) => {
-        const apiKey = getEnvApiKey(model.provider);
-        return apiKey ? { apiKey } : undefined;
-      },
-    });
+      ctx,
+    );
+    const lane = await harness.lane("main", ctx);
 
-    self = new ForgeAgent(config, opts, { harness, env, repo, lsp, flight, flightPath });
+    self = new ForgeAgent(config, opts, { harness, lane, session, skills, env, repo, lsp, flight, flightPath });
     return self;
   }
 
   /** 列出当前 workdir 下的历史会话（供 /resume）。 */
   static async listSessions(config: ForgeConfig): Promise<JsonlSessionMetadata[]> {
     const env = new NodeExecutionEnv({ cwd: config.workdir });
-    const repo = new JsonlSessionRepo({ fs: env, sessionsRoot: config.sessionsDir });
-    return repo.list({ cwd: config.workdir });
+    const repo = new JsonlSessionRepo({ fileSystem: env, sessionsRoot: config.sessionsDir });
+    return repo.list({ cwd: config.workdir }, TODO_CONTEXT);
   }
 
   // ── 后台子 agent 编排（SubAgentOrchestrator → 委托 SubAgentRegistry）──────────
@@ -495,7 +553,7 @@ export class ForgeAgent {
 
   /** 解析首选模型 ref；未知模型或缺 key → 回退主模型。返回 model + 对应 thinking。 */
   private resolvePreferredModel(ref: string): { model: Model<Api>; thinking: ThinkingLevel } {
-    let model = this.harness.getModel();
+    let model = this.currentModel; // 0.85 的 getModel() 变异步 → 自持当前模型（switchModel 时更新）
     let thinking: ThinkingLevel = this.config.thinkingLevel;
     try {
       const r = resolveModel(ref);
@@ -510,7 +568,7 @@ export class ForgeAgent {
   }
 
   /** 只读取证工具集：fs(读/列) + 搜索 + outline + repo_map + LSP(−rename)。共享主 agent 的 LspClient(warm 复用)。 */
-  private readonlyToolset(): AgentTool[] {
+  private readonlyToolset(): AgentHarnessTool<object | undefined>[] {
     const wd = this.config.workdir;
     const ro = this.config.allowReadOutsideWorkdir;
     return [
@@ -523,7 +581,7 @@ export class ForgeAgent {
   }
 
   /** Convergent 验证 agent 的工具集：只读取证 + bash（能跑命令/复现）。不含写工具与 spawn(防递归)。 */
-  private verifierToolset(): AgentTool[] {
+  private verifierToolset(): AgentHarnessTool<object | undefined>[] {
     return [...this.readonlyToolset(), makeBashTool(this.config.workdir)];
   }
 
@@ -537,16 +595,16 @@ export class ForgeAgent {
     systemPrompt: string;
     model: Model<Api>;
     thinking: ThinkingLevel;
-    tools: AgentTool[];
+    tools: AgentHarnessTool<object | undefined>[];
     /** 轮数上限；<=0 表示不限。 */
     maxTurns: number;
     signal: AbortSignal;
-    /** 可选权限闸门（如 Convergent 跑 bash 时仍硬拦灾难命令 / 走语义写守卫）。返回 {block} 即拦截；可异步。 */
-    gate?: (toolName: string, input: unknown) => ({ block: true; reason: string } | undefined) | Promise<{ block: true; reason: string } | undefined>;
+    /** 可选权限闸门（如 Convergent 跑 bash 时仍硬拦灾难命令 / 走语义写守卫）。返回 {block:{reason}} 即拦截；可异步。 */
+    gate?: (toolName: string, input: unknown) => ({ block: { reason: string } } | undefined) | Promise<{ block: { reason: string } } | undefined>;
     /** 用量统计订阅（如子 agent 计入 subTelemetry）。 */
-    telemetry?: (e: AgentHarnessEvent) => void;
+    telemetry?: (e: HarnessEvent) => void;
     /** 全量事件转发（如 Convergent 把活动实时显示到 UI）。 */
-    onEvent?: (e: AgentHarnessEvent) => void;
+    onEvent?: (e: HarnessEvent) => void;
     /** 每完成一轮回调（cumulative turns）。 */
     onTurn?: (turns: number) => void;
     /** 每次工具调用开始回调。 */
@@ -556,51 +614,56 @@ export class ForgeAgent {
   }): Promise<SubAgentResult> {
     const { task, systemPrompt, model, thinking, signal, maxTurns: cap, tools } = opts;
     const unlimited = cap <= 0;
-    const session = await this.repo.create({ cwd: this.config.workdir });
-    const sub = new AgentHarness({
-      env: this.env,
-      session,
-      tools,
-      model,
-      thinkingLevel: thinking,
-      streamOptions: streamOptionsOf(this.config),
-      systemPrompt,
-      getApiKeyAndHeaders: async (m: Model<Api>) => {
-        const apiKey = getEnvApiKey(m.provider);
-        return apiKey ? { apiKey } : undefined;
+    const session = await this.repo.create({ cwd: this.config.workdir }, this.ctx);
+    // 0.85：Context 线程化——把 AbortSignal 织进子 context，harness 侧的取消信号统一来自它。
+    const ctx = withAbortSignal(signal, TODO_CONTEXT);
+    const { harness: sub } = await AgentHarness.create(
+      {
+        session,
+        models: getModels(),
+        tools,
+        model,
+        thinkingLevel: thinking,
+        streamOptions: streamOptionsOf(this.config),
+        systemPrompt,
       },
-    });
+      ctx,
+    );
+    const subLane = await sub.lane("main", ctx);
     if (opts.gate) {
       const gate = opts.gate;
-      sub.on("tool_call", (e) => gate(e.toolName, e.input));
+      sub.hooks.on("before_tool", (e) => gate(e.toolName, e.args));
     }
-    signal.addEventListener("abort", () => void sub.abort(), { once: true });
-    const unsubTel = opts.telemetry ? sub.subscribe(opts.telemetry) : () => {};
-    const unsubEvt = opts.onEvent ? sub.subscribe(opts.onEvent) : () => {};
+    signal.addEventListener("abort", () => void subLane.abort(ctx).catch(() => {}), { once: true });
+    const unsubTel = opts.telemetry ? subscribeHarness(sub.events, opts.telemetry) : () => {};
+    const unsubEvt = opts.onEvent ? subscribeHarness(sub.events, opts.onEvent) : () => {};
     // 飞行记录：把子 harness 的全量事件也落盘（带 agent 标签，独立 context 状态机）。
-    const unsubFlight = opts.flightTag && this.flight ? sub.subscribe(this.flight.scope(opts.flightTag).handle) : () => {};
+    const unsubFlight = opts.flightTag && this.flight ? subscribeHarness(sub.events, this.flight.scope(opts.flightTag).handle) : () => {};
 
     let turns = 0;
     let toolCalls = 0;
     let hitLimit = false;
-    const unsub = sub.subscribe((e) => {
+    let lastText = "";
+    const unsub = subscribeHarness(sub.events, (e) => {
       if (e.type === "turn_end") {
         turns += 1;
+        lastText = textOf((e as { message?: AssistantMessage }).message); // prompt() 不再返回消息，从事件取
         opts.onTurn?.(turns);
         if (!unlimited && turns >= cap) {
           hitLimit = true;
-          void sub.abort(); // 达上限：abort 子 harness（非 ac），故不算 cancelled
+          void subLane.abort(ctx).catch(() => {}); // 达上限：abort 子 harness（非 ac），故不算 cancelled
         }
-      } else if (e.type === "tool_execution_start") {
+      } else if (e.type === "tool_start") {
         toolCalls += 1;
         opts.onToolStart?.(e.toolName, e.args, turns, toolCalls);
       }
     });
 
     try {
-      const msg = await sub.prompt(task);
-      await sub.waitForIdle();
-      const text = hitLimit ? `（达到 ${cap} 轮上限被截断，以下为当时的部分结论）\n${textOf(msg)}` : textOf(msg);
+      await subLane.prompt(task, undefined, ctx);
+      await subLane.waitForIdle(ctx);
+      const finalText = lastText || "(no text output)";
+      const text = hitLimit ? `（达到 ${cap} 轮上限被截断，以下为当时的部分结论）\n${finalText}` : finalText;
       return { text, turns, tools: toolCalls, hitLimit };
     } catch (e) {
       if (hitLimit) return { text: `（达到 ${cap} 轮上限被截断，无最终结论）`, turns, tools: toolCalls, hitLimit: true };
@@ -612,7 +675,7 @@ export class ForgeAgent {
       unsubEvt();
       unsubFlight();
       try {
-        await this.repo.delete(await session.getMetadata()); // 清理临时会话文件
+        await this.repo.delete(session.metadata, this.ctx); // 清理临时会话文件
       } catch {
         /* 删不掉就算了 */
       }
@@ -711,7 +774,7 @@ export class ForgeAgent {
         onEvent: (e) => this.opts.onConvergentEvent?.(e), // 活动实时显示（UI 加 ⟢ 前缀区分）
         gate: async (toolName, input) => {
           const d = policy.check(toolName, input);
-          if (d.verdict === "deny") return { block: true, reason: d.reason };
+          if (d.verdict === "deny") return { block: { reason: d.reason } };
           // review：Convergent 复现常 cd 进项目子目录跑只读分析，确定性层拿不准 → 交语义守卫
           // （以验收任务为意图上下文）。这正是修掉「只读命令被误判越界、Convergent 空烧轮数」的关键。
           if (d.verdict === "review") return await this.runWriteGuard(String((input as { cmd?: unknown })?.cmd ?? ""), goal);
@@ -745,10 +808,10 @@ export class ForgeAgent {
   /**
    * 语义写边界守卫：确定性层判 review（cd 到 workdir 外 + 含写信号）时调用。
    * 用 flash·非思考带最小上下文（命令 + workdir + 本轮指令，不喂工具结果/agent 叙述）判一次。
-   * 返回 {block} 表示拦截；undefined 表示放行。fail-open：无 key / 报错 / 解析不到裁决 → 放行
+   * 返回 {block:{reason}} 表示拦截；undefined 表示放行。fail-open：无 key / 报错 / 解析不到裁决 → 放行
    * （best-effort 边界，灾难命令已由 HARD_DENY 黑名单在确定性层硬拦，不会走到这里）。
    */
-  private async runWriteGuard(command: string, instruction: string): Promise<{ block: true; reason: string } | undefined> {
+  private async runWriteGuard(command: string, instruction: string): Promise<{ block: { reason: string } } | undefined> {
     if (!command) return undefined;
     const { model } = this.resolvePreferredModel("deepseek/deepseek-v4-flash");
     const apiKey = getEnvApiKey(model.provider);
@@ -760,7 +823,7 @@ export class ForgeAgent {
       if (resp.stopReason === "error" || resp.stopReason === "aborted") return undefined;
       const text = resp.content.filter((c) => (c as { type: string }).type === "text").map((c) => (c as { text: string }).text).join("");
       const v = parseWriteGuardVerdict(text);
-      if (v.verdict === "deny") return { block: true, reason: `越界写入被拦截（语义守卫）：${v.reason}（确需可设 FORGE_ALLOW_WRITE_OUTSIDE=1）` };
+      if (v.verdict === "deny") return { block: { reason: `越界写入被拦截（语义守卫）：${v.reason}（确需可设 FORGE_ALLOW_WRITE_OUTSIDE=1）` } };
       return undefined;
     } catch {
       return undefined; // 守卫自身故障不卡主流程
@@ -835,9 +898,9 @@ export class ForgeAgent {
     }
   }
 
-  /** 注入给 runFullCompaction 的「调一次模型做摘要」回调（用 pi-ai 的 completeSimple）。 */
+  /** 注入给 runFullCompaction 的「调一次模型做摘要」回调（用 pi-ai /compat 的 completeSimple）。 */
   private makeSummarizeFn(): SummarizeFn {
-    const model = this.harness.getModel();
+    const model = this.currentModel;
     const reserve = this.config.compaction.reserveTokens;
     const thinking = this.config.thinkingLevel;
     return async ({ systemPrompt, userPrompt }) => {
@@ -860,18 +923,31 @@ export class ForgeAgent {
     this.status("Compacting context…");
     this.currentAbort = new AbortController();
     try {
-      const r = await this.harness.compact(); // 触发 session_before_compact → 自研压缩
-      this.compactionFailures = 0;
-      // 压缩后即时重算上下文用量（摘要 + 实际保留窗口），不等下一轮 assistant usage——
-      // 否则 session_compact 刷新仪表盘时仍读到压缩前的旧值。用 r.firstKeptEntryId（实际生效的，
-      // 自研 / 库默认两条路径都对）在暂存的 branch 上求保留 token。
-      this.lastContextTokens = estimateTokens(r.summary) + keptTokensFrom(this.pendingBranchPlan ?? [], r.firstKeptEntryId);
-      this.pendingBranchPlan = undefined;
-      // TODO(rehydrate): 压缩后重注入最近访问文件全文（≤5 个 / ~50k token 预算）。
-      // 依赖：先建「最近访问文件追踪」基础设施。当前先靠摘要第 3 段 Files & Code
-      // Sections 保留路径/片段 + 工具截断使按需重读廉价。
-      // 注意：DeepSeek 非顶尖模型，往上下文猛塞反而抬高幻觉率，rehydrate 要克制、按预算注入。
-      this.notice(`\x1b[38;5;250m   ↻ Context compaction: ~${r.tokensBefore} tokens → 9-section summary (kept from ${r.firstKeptEntryId.slice(0, 8)})\x1b[0m\n`);
+      // 0.85：lane.compact() 返回 Result（不抛错）——ok/err 显式分支。
+      const r = await this.lane.compact(undefined, this.ctx); // 触发 before_compaction → 自研压缩
+      if (r.ok) {
+        this.compactionFailures = 0;
+        // 压缩后即时重算上下文用量（摘要 + 实际保留窗口），不等下一轮 assistant usage——
+        // 否则 compaction_end 刷新仪表盘时仍读到压缩前的旧值。
+        this.lastContextTokens = await this.recomputeContextAfterCompaction();
+        this.pendingBranchPlan = undefined;
+        const snap = this.lastCompactResult;
+        // TODO(rehydrate): 压缩后重注入最近访问文件全文（≤5 个 / ~50k token 预算）。
+        // 依赖：先建「最近访问文件追踪」基础设施。当前先靠摘要第 3 段 Files & Code
+        // Sections 保留路径/片段 + 工具截断使按需重读廉价。
+        // 注意：DeepSeek 非顶尖模型，往上下文猛塞反而抬高幻觉率，rehydrate 要克制、按预算注入。
+        this.notice(
+          snap
+            ? `\x1b[38;5;250m   ↻ Context compaction: ~${snap.tokensBefore} tokens → 9-section summary (kept from ${snap.firstKeptEntryId.slice(0, 8)})\x1b[0m\n`
+            : `\x1b[38;5;250m   ↻ Context compaction done (library default summary)\x1b[0m\n`,
+        );
+      } else {
+        // NothingToCompact（内容太少）无害静默；LaneBusy 理论上不出现（maybeCompact 在空闲后触发）。
+        const tag = (r.error as { _tag?: string })?._tag ?? "";
+        if (tag !== "NothingToCompact" && tag !== "LaneBusy") {
+          throw new Error(String((r.error as { message?: string })?.message ?? (tag || "compaction failed")));
+        }
+      }
     } catch (e) {
       if (this.currentAbort?.signal.aborted) {
         this.notice(`\x1b[38;5;250m   ⎪ Compaction aborted\x1b[0m\n`); // 用户 Ctrl+C，不计入熔断
@@ -887,6 +963,32 @@ export class ForgeAgent {
       this.currentAbort = undefined;
       this.status(null); // 关闭进度行
     }
+  }
+
+  /**
+   * 压缩后重算上下文用量：优先用 before_compaction 暂存的自研结果（摘要 + 自选保留窗口）；
+   * 回退库默认压缩（钩子没接管）时读会话里最新 compaction entry 的 retainedTail 估算。
+   * 两条路径都不依赖旧 compact() 返回的 firstKeptEntryId（0.85 已移除该字段）。
+   */
+  private async recomputeContextAfterCompaction(): Promise<number> {
+    const snap = this.lastCompactResult;
+    if (snap) {
+      this.lastCompactResult = undefined;
+      return estimateTokens(snap.summary) + snap.keptTokens;
+    }
+    try {
+      const entries = await this.lane.findEntries(undefined, this.ctx);
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i]!;
+        if (e.type === "compaction") {
+          const c = e as CompactionEntry;
+          return estimateTokens(c.summary) + c.retainedTail.reduce((s, m) => s + estimateTokens(textOfMessage(m as Message)), 0);
+        }
+      }
+    } catch {
+      /* 读取失败沿用旧值，下一轮 turn_end 会自然校正 */
+    }
+    return this.lastContextTokens;
   }
 
   /** 压缩触发策略：上下文用量 > 90% 窗口即自动压缩（已熔断则跳过）。 */
@@ -914,7 +1016,7 @@ export class ForgeAgent {
 
   /** 当前模型的上下文窗口大小。 */
   get contextWindow(): number {
-    return this.harness.getModel().contextWindow;
+    return this.currentModel.contextWindow;
   }
 
   /** 压缩用的「有效窗口」：配了 maxContextTokens（且小于真实窗口）就用它，否则用真实窗口。
@@ -926,8 +1028,8 @@ export class ForgeAgent {
   }
 
   /** 订阅底层事件流（供 Ink TUI 把事件喂进 React state）。返回取消订阅函数。 */
-  subscribe(listener: (event: AgentHarnessEvent) => void): () => void {
-    return this.harness.subscribe(listener);
+  subscribe(listener: (event: HarnessEvent) => void): () => void {
+    return subscribeHarness(this.harness.events, listener);
   }
 
   /** 框架通知输出：有 onNotice 走它（Ink），否则写 stdout。 */
@@ -953,7 +1055,7 @@ export class ForgeAgent {
 
   /** 当前可用 skills 清单（供 /skills）。 */
   listSkills(): Skill[] {
-    return this.harness.getResources().skills ?? [];
+    return this.skills; // 0.85 的 getResources() 变异步 → 改自持启动时加载的清单
   }
 
   /** 打开「跳过所有权限确认」（供 /pass-permissions）。灾难性命令的硬拦截仍生效。 */
@@ -975,9 +1077,10 @@ export class ForgeAgent {
 
   /** 运行时切换模型。 */
   async switchModel(ref: string): Promise<{ ref: string; provider: string; live: boolean }> {
-    const { provider, model } = resolveModel(ref);
-    await this.harness.setModel(model);
-    await this.harness.setThinkingLevel(model.reasoning ? "xhigh" : "off"); // 新模型也拉满 reasoning
+    const { provider, modelId, model } = resolveModel(ref);
+    await this.lane.setModel({ provider, modelId }, this.ctx); // 0.85：setModel 收 ModelIdentity
+    await this.lane.setThinkingLevel(model.reasoning ? "xhigh" : "off", this.ctx); // 新模型也拉满 reasoning
+    this.currentModel = model;
     this.live = hasKey(provider);
     this.currentRef = ref;
     return { ref, provider, live: this.live };
@@ -988,7 +1091,7 @@ export class ForgeAgent {
     this.subagents.abortAllRunning();
     this.currentAbort?.abort();
     try {
-      await this.harness.abort();
+      await this.lane.abort(this.ctx);
     } catch {
       /* 非流式态 abort 可能抛错，忽略 */
     }
@@ -1013,19 +1116,21 @@ export class ForgeAgent {
    */
   steer(text: string): void {
     this.audit.write({ kind: "prompt", preview: `[steer] ${text}` });
-    void this.harness.steer(text);
+    void this.lane.steer(text, undefined, this.ctx);
   }
 
   /** 跑一轮用户输入，按需压缩，再做 /converge 验收检查（若有活动目标）。 */
   async run(input: string): Promise<void> {
     this.audit.write({ kind: "prompt", preview: input });
+    // 0.85 的 run_start 事件不带 prompt —— user_input 飞行记录改在这里手动落。
+    this.flight?.record("user_input", { prompt: input });
     this.currentUserInstruction = input; // 供语义写守卫判断本轮意图
     this.runChangedFiles.clear();
-    const msg = await this.harness.prompt(input);
-    await this.harness.waitForIdle();
+    await this.lane.prompt(input, undefined, this.ctx);
+    await this.lane.waitForIdle(this.ctx);
     await this.maybeSelfReview(); // P1：本轮有写 → 强制一次 diff 自审，剔除无关改动（防过度编辑）
     await this.maybeCompact();
-    await this.checkConverge(textOf(msg)); // 有 active 目标才会真正动作
+    await this.checkConverge(this.lastAssistantText || "(no text output)"); // 有 active 目标才会真正动作
   }
 
   /**
@@ -1046,7 +1151,7 @@ export class ForgeAgent {
       "若有需还原的改动，先还原再给结论。",
     ].join("\n");
     this.audit.write({ kind: "prompt", preview: "[收尾自审] 最小化复查(git diff)" });
-    await this.harness.prompt(review);
-    await this.harness.waitForIdle();
+    await this.lane.prompt(review, undefined, this.ctx);
+    await this.lane.waitForIdle(this.ctx);
   }
 }

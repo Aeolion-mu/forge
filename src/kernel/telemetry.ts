@@ -1,4 +1,4 @@
-import type { AgentHarnessEvent } from "@earendil-works/pi-agent-core";
+import type { HarnessEvent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { costRmb, type Rate } from "./pricing.js";
 
@@ -30,8 +30,8 @@ export class Telemetry {
   /** 定价表（来自 config，已合并内置默认）；不传则 costRmb 用内置默认。 */
   constructor(private readonly rates?: Record<string, Rate>) {}
 
-  /** 直接作为 harness.subscribe 的 listener（事件类型已扩到 AgentHarnessEvent）。 */
-  handle = (event: AgentHarnessEvent): void => {
+  /** 直接作为事件 listener（0.85 起经 subscribeHarness 全类型扇出）。 */
+  handle = (event: HarnessEvent): void => {
     switch (event.type) {
       case "turn_end": {
         this.turns += 1;
@@ -46,10 +46,10 @@ export class Telemetry {
         }
         break;
       }
-      case "tool_execution_start":
+      case "tool_start":
         this.toolStart.set(event.toolCallId, Date.now());
         break;
-      case "tool_execution_end": {
+      case "tool_end": {
         const s = this.tools.get(event.toolName) ?? { calls: 0, errors: 0, totalMs: 0 };
         s.calls += 1;
         if (event.isError) s.errors += 1;

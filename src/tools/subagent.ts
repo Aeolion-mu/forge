@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 
 /** 子 agent 运行结果（含执行信息）。 */
 export interface SubAgentResult {
@@ -50,8 +50,8 @@ const noneSchema = Type.Object({});
  *   subagent_cancel —— 撤销运行中的子 agent
  * 子 agent 跑在隔离会话、只读工具集（含 code-intel）、无本组工具（防递归）。
  */
-export function makeSubAgentTools(orch: SubAgentOrchestrator): AgentTool[] {
-  const spawn: AgentTool<typeof spawnSchema, { id: string; role: string }> = {
+export function makeSubAgentTools(orch: SubAgentOrchestrator): AgentHarnessTool<object | undefined>[] {
+  const spawn: AgentHarnessTool<object | undefined, typeof spawnSchema, { id: string; role: string }> = {
     name: "spawn_subagent",
     label: "派发子Agent",
     description:
@@ -59,7 +59,7 @@ export function makeSubAgentTools(orch: SubAgentOrchestrator): AgentTool[] {
       "**它完成后，结论会自动作为新一轮消息喂回给你，无需你等待或轮询**。" +
       "想中途看进度用 subagent_list，想叫停用 subagent_cancel(id)。maxTurns 控制其轮数预算。适合调研 / 检索 / 分析类子任务。",
     parameters: spawnSchema,
-    execute: async (_id, p) => {
+    execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const id = orch.spawn(p.role, p.task, p.maxTurns);
       return {
         content: [{ type: "text", text: `已后台启动子 Agent [${p.role}]，id=${id}。它完成后结论会自动回来；其间你可继续处理别的，或用 subagent_list 看进度、subagent_cancel("${id}") 撤销。` }],
@@ -68,20 +68,20 @@ export function makeSubAgentTools(orch: SubAgentOrchestrator): AgentTool[] {
     },
   };
 
-  const cancel: AgentTool<typeof idSchema, { id: string }> = {
+  const cancel: AgentHarnessTool<object | undefined, typeof idSchema, { id: string }> = {
     name: "subagent_cancel",
     label: "撤销子Agent",
     description: "中途撤销一个正在后台运行的子 Agent（按 id）。",
     parameters: idSchema,
-    execute: async (_id, p) => ({ content: [{ type: "text", text: orch.cancel(p.id) }], details: { id: p.id } }),
+    execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => ({ content: [{ type: "text", text: orch.cancel(p.id) }], details: { id: p.id } }),
   };
 
-  const list: AgentTool<typeof noneSchema, { count: number }> = {
+  const list: AgentHarnessTool<object | undefined, typeof noneSchema, { count: number }> = {
     name: "subagent_list",
     label: "列子Agent",
     description: "列出所有子 Agent 的状态（running/done/cancelled/failed）+ 已用轮数 / 工具数 / 已运行秒数 + 最近运行日志（判断是否在推进或卡死）。",
     parameters: noneSchema,
-    execute: async () => {
+    execute: async (_id, _p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const xs = orch.list();
       const body = xs.length
         ? xs
@@ -95,5 +95,5 @@ export function makeSubAgentTools(orch: SubAgentOrchestrator): AgentTool[] {
     },
   };
 
-  return [spawn, cancel, list] as unknown as AgentTool[];
+  return [spawn, cancel, list] as unknown as AgentHarnessTool<object | undefined>[];
 }
