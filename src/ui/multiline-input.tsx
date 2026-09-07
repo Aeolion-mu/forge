@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Text, useInput } from "ink";
+import { Text, useInput, usePaste } from "ink";
 import * as ed from "./text-editor.js";
 import { visibleWidth } from "./markdown.js";
 
@@ -80,6 +80,15 @@ export function MultilineInput({
     cursorRef.current = c;
     setCursor(c);
   };
+
+  // 括号粘贴（Ink 自动开 2004h）：整段插入为多行文本，绝不逐行触发提交——
+  // 没这个钩子时终端走裸粘贴，多行里的 \r 会被当逐个回车、全部提交/steer。
+  usePaste(
+    (text) => {
+      apply(ed.insert({ text: valueRef.current, cursor: cursorRef.current }, ed.normalizeNewlines(text)));
+    },
+    { isActive },
+  );
 
   useInput(
     (input, key) => {
