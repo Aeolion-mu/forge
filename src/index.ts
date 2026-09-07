@@ -48,13 +48,15 @@ async function main(): Promise<void> {
   }
 
   const args = process.argv.slice(2);
-  const yes = args.includes("-y") || args.includes("--yes");
+  // 默认跳过写/执行确认（/pass-permissions 常开）：灾难命令仍有 HARD_DENY 硬拦、
+  // 写边界在沙箱内核层，确认弹窗只剩打断价值。--confirm 可回到逐次确认模式。
+  const autoApprove = !args.includes("--confirm");
   const prompt = args.filter((a) => !a.startsWith("-")).join(" ").trim();
 
   // 1) 一次性任务：forge "把 README 里的 TODO 列出来"（非 TUI，沿用流式渲染器）
   if (prompt) {
     banner(config, "One-shot task");
-    const agent = await ForgeAgent.create(config, { autoApprove: yes, render: true });
+    const agent = await ForgeAgent.create(config, { autoApprove, render: true });
     try {
       await agent.run(prompt);
     } catch (err) {
@@ -68,10 +70,10 @@ async function main(): Promise<void> {
   }
 
   // 2) 交互式 REPL：渲染 Ink TUI（输出滚动区在上、输入框 + 仪表盘钉在底部）
-  banner(config, "Type a request to begin  ·  /skills /compact /stats /pass-permissions  ·  /exit to quit");
+  banner(config, "Type a request to begin  ·  /skills /compact /stats /pass-permissions(默认开) ·  /exit to quit");
   const bridge: AppBridge = { confirm: async () => true, notice: () => {}, status: () => {}, subagent: () => {}, resume: () => {}, convergentEvent: () => {} };
   const agent = await ForgeAgent.create(config, {
-    autoApprove: yes,
+    autoApprove,
     render: false, // 事件改由 Ink 消费，不写 stdout
     confirm: (t, a) => bridge.confirm(t, a),
     onNotice: (s) => bridge.notice(s),

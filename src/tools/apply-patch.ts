@@ -22,7 +22,10 @@ import { computeFileDiff, type FileDiff } from "../ui/diff.js";
  */
 
 const patchSchema = Type.Object({
-  patch: Type.String({ description: "Begin/End Patch 格式补丁：Update/Add/Delete File + @@ hunk（空格上下文 / -删 / +增）" }),
+  patch: Type.String({
+    description:
+      "*** Begin Patch / *** Update|Add|Delete File: <path> / @@ hunk（空格上下文 / -删 / +增）/ *** End Patch。Add File 的内容行以 + 开头。标记行的 *** 前缀不可省略",
+  }),
 });
 
 function safePath(workdir: string, p: string): string {
@@ -37,20 +40,30 @@ interface FileOp {
   body: string[];
 }
 
+/**
+ * 文件标记行：`*** Update File: path`（严格 Codex 格式）或裸 `Update File: path`。
+ * 后者是常见模型变体（实测 glm/gpt 都会发）——只认严格格式会把整份 patch 判成
+ * 「未解析到文件操作」。行首空格**不**容忍（空格只许跟在 *** 后面）：hunk 上下文行
+ * 以空格开头，" Update File: xxx" 是内容不是标记。
+ */
+const FILE_MARKER_RE = /^(?:\*\*\*[ \t]*)?(Update|Add|Delete) File:\s*(.+)$/;
+
 function parsePatch(patch: string): FileOp[] {
   const ops: FileOp[] = [];
   let cur: FileOp | null = null;
   // 按 \r?\n 切分：模型输出的 patch 文本可能带 CRLF（与宿主平台无关），残留的 \r
-  // 会让 *** File 标记正则匹配失败（(.+)$ 卡在 \r 前），且污染 body 行内容。
+  // 会让标记正则匹配失败（(.+)$ 卡在 \r 前），且污染 body 行内容。
   for (const line of patch.split(/\r?\n/)) {
     if (line.startsWith("*** Begin Patch") || line.startsWith("*** End Patch")) continue;
-    const upd = /^\*\*\* Update File:\s*(.+)$/.exec(line);
-    const add = /^\*\*\* Add File:\s*(.+)$/.exec(line);
-    const del = /^\*\*\* Delete File:\s*(.+)$/.exec(line);
-    if (upd) cur = pushOp(ops, "update", upd[1]);
-    else if (add) cur = pushOp(ops, "add", add[1]);
-    else if (del) cur = pushOp(ops, "delete", del[1]);
-    else if (cur) cur.body.push(line);
+    // markdown 围栏（```text … ``` 包裹整份 patch 的常见习惯）：跳过，不当 body。
+    if (/^\s*```/.test(line)) continue;
+    const m = FILE_MARKER_RE.exec(line);
+    if (m) {
+      const kind = m[1]!.toLowerCase() as FileOp["kind"];
+      cur = pushOp(ops, kind, m[2]!);
+    } else if (cur) {
+      cur.body.push(line);
+    }
   }
   return ops;
 }

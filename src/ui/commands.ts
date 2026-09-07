@@ -13,7 +13,7 @@ export const COMMANDS: SlashCommand[] = [
   { name: "/compact", desc: "Compact context (9-section summary)" },
   { name: "/skills", desc: "List loaded skills" },
   { name: "/stats", desc: "Show session metrics" },
-  { name: "/pass-permissions", desc: "Bypass write/exec confirms (dangerous cmds still blocked)" },
+  { name: "/pass-permissions", desc: "Bypass write/exec confirms (ON by default; --confirm to re-enable)" },
   { name: "/exit", desc: "Exit Forge" },
 ];
 

@@ -60,7 +60,7 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState("");
   const [confirm, setConfirm] = useState<ConfirmReq | null>(null);
-  const [bypass, setBypass] = useState(false);
+  const [bypass, setBypass] = useState(agent.bypassingPermissions); // 启动默认 pass-permissions 开
   const [, setTick] = useState(0);
   const [dash, setDash] = useState({ turns: 0, inTok: 0, outTok: 0, cost: 0, ctxUsed: 0, cacheHit: 0 });
   // 长操作进度（压缩等）：非 null 时在输入框上方显示动态状态行。
@@ -335,9 +335,9 @@ export function App({ agent, config, bridge }: { agent: ForgeAgent; config: Forg
     () => ({
       "/stats": () => push(agent.telemetry.summary()),
       "/pass-permissions": () => {
-        agent.passPermissions();
+        agent.passPermissions(); // 默认已开：此命令现在只是显式确认（幂等）
         setBypass(true);
-        push(ansi.amber("Permission bypass ON — write/exec tools auto-approved. Catastrophic commands (rm -rf /, fork bombs, raw disk writes) are still blocked."));
+        push(ansi.dim("Permission bypass 已默认开启（--confirm 可回到逐次确认）。灾难命令（rm -rf /、fork bomb、裸写磁盘）仍被硬拦。"));
       },
       "/skills": () => {
         const sk = agent.listSkills();
