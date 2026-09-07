@@ -6,6 +6,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { DEFAULT_RMB_PER_M, type Rate } from "./kernel/pricing.js";
 import { defaultWritePaths, type SandboxPolicy } from "./sandbox/bwrap.js";
+import { buildCustomModel, type CustomModelEntry } from "./kernel/models.js";
 
 /** forge.config.json 里的一条可选模型。 */
 export interface ModelEntry {
@@ -57,6 +58,8 @@ export interface ForgeConfig {
   compaction: CompactionConfig;
   /** 模型请求重试 / 超时。 */
   stream: StreamConfig;
+  /** 自建/内网 OpenAI 兼容端点（forge.config.json customModels）。 */
+  customModels: CustomModelEntry[];
   /** 每百万 token 定价（人民币）：内置默认 ⊕ forge.config.json 的 pricing 覆盖/扩充。 */
   pricing: Record<string, Rate>;
   /** 只读越界：允许 read_file/list_dir/glob/grep 读 workdir 外的绝对路径（写仍锁死 workdir）。默认 false。 */
@@ -104,6 +107,7 @@ export interface FlightLogConfig {
 interface ForgeFile {
   defaultModel?: string;
   models?: ModelEntry[];
+  customModels?: CustomModelEntry[];
   reserveTokens?: number;
   keepRecentTokens?: number;
   maxRetries?: number;
@@ -154,6 +158,37 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
   if (o.defaultModel !== undefined) {
     if (typeof o.defaultModel === "string" && o.defaultModel.trim()) out.defaultModel = o.defaultModel;
     else issues.push("defaultModel 应为非空字符串");
+  }
+  if (o.customModels !== undefined) {
+    if (!Array.isArray(o.customModels)) {
+      issues.push("customModels 应为数组（OpenAI 兼容自建端点）");
+    } else {
+      const customs: CustomModelEntry[] = [];
+      o.customModels.forEach((m, i) => {
+        const mm = m as Record<string, unknown>;
+        const bad = (why: string) => issues.push(`customModels[${i}] ${why}`);
+        if (!mm || typeof mm !== "object") return bad("应为对象");
+        if (!(typeof mm.ref === "string" && mm.ref.includes("/"))) return bad("ref 应为 \"provider/modelId\" 形式");
+        if (!(typeof mm.baseUrl === "string" && /^https?:\/\//.test(mm.baseUrl))) return bad("baseUrl 应为 http(s) URL");
+        if (!(typeof mm.contextWindow === "number" && Number.isFinite(mm.contextWindow) && mm.contextWindow > 0)) {
+          return bad("contextWindow 应为正数");
+        }
+        // 未知字段报错（与 ssh 段同规矩：避免「配了却静默失效」）。
+        const KNOWN = new Set(["ref", "label", "baseUrl", "contextWindow", "maxTokens", "reasoning", "apiKeyEnv"]);
+        const unknown = Object.keys(mm).filter((k) => !KNOWN.has(k));
+        if (unknown.length) return bad(`未知字段 ${unknown.join(", ")}`);
+        customs.push({
+          ref: mm.ref,
+          ...(typeof mm.label === "string" ? { label: mm.label } : {}),
+          baseUrl: mm.baseUrl,
+          contextWindow: mm.contextWindow,
+          ...(typeof mm.maxTokens === "number" ? { maxTokens: mm.maxTokens } : {}),
+          ...(typeof mm.reasoning === "boolean" ? { reasoning: mm.reasoning } : {}),
+          ...(typeof mm.apiKeyEnv === "string" ? { apiKeyEnv: mm.apiKeyEnv } : {}),
+        });
+      });
+      out.customModels = customs;
+    }
   }
   for (const k of ["reserveTokens", "keepRecentTokens", "maxRetries", "maxRetryDelayMs", "timeoutMs", "maxContextTokens"] as const) {
     const v = o[k];
@@ -273,21 +308,28 @@ function readConfigFile(): ForgeFile {
   return validateConfigFile(parsed, "forge.config.json");
 }
 
-/** 该 provider 当前是否有可用 key。 */
+/** 自定义模型（customModels）配置，loadConfig 时填充；resolveModel/hasKey 用。 */
+let activeCustomModels: CustomModelEntry[] = [];
+
+/** 该 provider 当前是否有可用 key（自定义模型：keyless 端点恒 true；配了 apiKeyEnv 看 env）。 */
 export function hasKey(provider: string): boolean {
+  const custom = activeCustomModels.find((e) => e.ref.split("/")[0] === provider);
+  if (custom) return custom.apiKeyEnv ? Boolean(process.env[custom.apiKeyEnv]) : true;
   return Boolean(getEnvApiKey(provider));
 }
 
-/** 把 "provider/modelId" 解析成具体 Model 对象。 */
+/** 把 "provider/modelId" 解析成具体 Model 对象（先查 customModels，再查 pi-ai 内置目录）。 */
 export function resolveModel(ref: string): { provider: string; modelId: string; model: Model<Api> } {
   const slash = ref.indexOf("/");
   if (slash < 0) throw new Error(`模型 ref 需要 "provider/model" 形式，收到：${ref}`);
   const provider = ref.slice(0, slash);
   const modelId = ref.slice(slash + 1);
+  const custom = activeCustomModels.find((e) => e.ref === ref);
+  if (custom) return { provider, modelId, model: buildCustomModel(custom) };
   // getModel 泛型要求字面量；运行时是字符串，这里收口为一次断言。
   // 注意：getModel 对未知 provider/model 返回 undefined（不抛错），需自行校验。
   const model = getModel(provider as never, modelId as never) as Model<Api> | undefined;
-  if (!model) throw new Error(`未知模型：${ref}（provider 或 modelId 不在 pi-ai 内置目录中）`);
+  if (!model) throw new Error(`未知模型：${ref}（provider 或 modelId 不在 pi-ai 内置目录中，也不是 customModels）`);
   return { provider, modelId, model };
 }
 
@@ -295,6 +337,7 @@ export function loadConfig(): ForgeConfig {
   loadDotEnv();
   const file = readConfigFile();
 
+  activeCustomModels = file.customModels ?? [];
   const models = file.models?.length ? file.models : BUILTIN.models;
   // 优先级：环境变量 FORGE_MODEL > 配置文件 defaultModel > 内置默认
   const modelRef = process.env.FORGE_MODEL?.trim() || file.defaultModel || BUILTIN.defaultModel;
@@ -308,6 +351,7 @@ export function loadConfig(): ForgeConfig {
     modelId,
     model,
     live: hasKey(provider),
+    customModels: activeCustomModels,
     // 默认把 reasoning 模型拉满（xhigh→DeepSeek reasoning_effort:max）；非 reasoning 模型关掉。
     thinkingLevel: (process.env.FORGE_THINKING as ThinkingLevel) || (model.reasoning ? "xhigh" : "off"),
     models,

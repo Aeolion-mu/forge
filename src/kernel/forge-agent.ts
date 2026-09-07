@@ -503,7 +503,7 @@ export class ForgeAgent {
     const { harness } = await AgentHarness.create(
       {
         session,
-        models: getModels(), // 全部内置 provider + env key 解析（见 kernel/models.ts）
+        models: getModels(config.customModels), // 内置 provider + customModels 内网端点（见 kernel/models.ts）
         tools,
         resources: { skills },
         model: config.model,
@@ -620,7 +620,7 @@ export class ForgeAgent {
     const { harness: sub } = await AgentHarness.create(
       {
         session,
-        models: getModels(),
+        models: getModels(this.config.customModels),
         tools,
         model,
         thinkingLevel: thinking,
