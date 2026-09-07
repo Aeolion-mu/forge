@@ -85,7 +85,7 @@ async function main(): Promise<void> {
   // 备用屏 + 鼠标上报；Ink 喂过滤后的 stdin（鼠标序列剥走，键盘/粘贴原样透传）
   const io = new TerminalIo(stdout);
   const mouseStdin = createMouseStdin(process.stdin);
-  io.enter();
+  io.enter({ mouse: process.env.FORGE_NO_MOUSE !== "1" }); // FORGE_NO_MOUSE=1：不开鼠标捕获，保留原生选择
   // exitOnCtrlC:false → 由 App 自己接管 Ctrl+C（运行中=中止 / 有输入=清空 / 空输入按两次=退出）
   // stdin 断言：Ink 类型要 ReadStream，运行时只用 on/setRawMode/isTTY——代理全部提供。
   const app = render(createElement(App, { agent, config, bridge, mouseStdin }), {

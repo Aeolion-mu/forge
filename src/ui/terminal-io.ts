@@ -222,11 +222,13 @@ export class TerminalIo {
     return this.active;
   }
 
-  enter(): void {
+  /** mouse=false 时不开鼠标上报（FORGE_NO_MOUSE=1：保留终端原生选择/复制）。 */
+  enter(opts: { mouse?: boolean } = {}): void {
     if (this.active) return;
     this.active = true;
     // 顺序：先切备用屏（保存光标），再开鼠标/藏光标
-    this.out.write(`${ESC}[?1049h${ESC}[?1000h${ESC}[?1006h${ESC}[?25l`);
+    const mouse = opts.mouse !== false ? `${ESC}[?1000h${ESC}[?1006h` : "";
+    this.out.write(`${ESC}[?1049h${mouse}${ESC}[?25l`);
     const onSignal = () => {
       this.restore();
       process.exit(0);

@@ -14,6 +14,7 @@ export const COMMANDS: SlashCommand[] = [
   { name: "/skills", desc: "List loaded skills" },
   { name: "/stats", desc: "Show session metrics" },
   { name: "/pass-permissions", desc: "Bypass write/exec confirms (ON by default; --confirm to re-enable)" },
+  { name: "/mouse", desc: "Mouse capture on/off (off = native text selection; PgUp/PgDn still scroll)" },
   { name: "/exit", desc: "Exit Forge" },
 ];
 

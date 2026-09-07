@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Box, Text, useApp, useInput, useWindowSize } from "ink";
+import { Box, Text, useApp, useInput, useStdout, useWindowSize } from "ink";
 import type { HarnessEvent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { renderMarkdown } from "./markdown.js";
@@ -95,6 +95,15 @@ export function App({
   const [newCount, setNewCount] = useState(0);
   // 鼠标点击输入框 → 请求把光标移到该列（消费后置 null）。
   const [cursorCol, setCursorCol] = useState<number | null>(null);
+  // 鼠标捕获开关：关掉后终端原生「拖拽选择 + 复制」恢复（forge 内滚轮/点击随之失效，
+  // 键盘 PgUp/PgDn 滚动不受影响）。FORGE_NO_MOUSE=1 启动即关。
+  const [mouseOn, setMouseOn] = useState(process.env.FORGE_NO_MOUSE !== "1");
+
+  // 鼠标捕获切换 → 写终端上报开关（TerminalIo.restore 退出时无条件关，幂等安全）
+  const { stdout: ioOut } = useStdout();
+  useEffect(() => {
+    ioOut.write(mouseOn ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1006l\x1b[?1000l");
+  }, [mouseOn, ioOut]);
 
   // 命令历史：↑/↓ 翻看已发出的命令。histIdx=null 表示在编辑新输入。
   const historyRef = useRef<string[]>([]);
@@ -142,7 +151,7 @@ export function App({
     const sb = getSandboxStatus();
     const live = config.live ? "\x1b[32m● LIVE\x1b[0m" : "\x1b[31m● no key\x1b[0m";
     const lines = [
-      ...renderBanner(),
+      ...renderBanner().split("\n"), // ← 整体是单个多行字符串：split 出行，而非逐字符展开（曾致左列竖条乱码）
       "",
       ` ${ansi.dim("Terminal Coding Agent ·")} ${config.modelRef} ${ansi.dim("·")} ${live}`,
     ];
@@ -154,7 +163,7 @@ export function App({
     if (config.allowReadOutsideWorkdir) {
       lines.push(` ${ansi.amber("⚠ read-outside-workdir ON")} ${ansi.dim("— read-only tools may read outside workdir")}`);
     }
-    lines.push("", ansi.dim("滚轮/PgUp 回看历史 · 点击折叠的工具结果可展开 · /exit 退出"));
+    lines.push("", ansi.dim("滚轮/PgUp 回看历史 · 点击折叠的工具结果可展开 · 原生选择按住 Shift(或 Fn/Option) · /mouse 关闭鼠标捕获 · /exit 退出"));
     pushBlock({ kind: "banner", lines });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -433,6 +442,15 @@ export function App({
         const sk = agent.listSkills();
         push(sk.length ? sk.map((s) => `  · \x1b[1m${s.name}\x1b[0m ${s.description}`).join("\n") : ansi.dim("(no skills loaded)"));
       },
+      "/mouse": () => {
+        const next = !mouseOn;
+        setMouseOn(next);
+        push(
+          next
+            ? ansi.dim("鼠标捕获已开启（滚轮/点击可用）。原生选择需按住修饰键：Terminal.app=Fn · iTerm2=Option · VSCode/多数终端=Shift。")
+            : ansi.dim("鼠标捕获已关闭——现在可以拖拽选择文本、Cmd+C 复制（滚轮/点击失效，键盘 PgUp/PgDn 仍可滚动）。/mouse 重新开启。"),
+        );
+      },
       "/compact": async () => {
         try {
           await agent.compactNow();
@@ -441,7 +459,7 @@ export function App({
         }
       },
     }),
-    [agent, push],
+    [agent, push, mouseOn],
   );
 
   const onSubmit = useCallback(
