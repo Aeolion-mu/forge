@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderBlockLines, renderLines, flattenBlocks, defaultCollapsed, type Block } from "../src/ui/blocks.js";
+import { renderBlockLines, renderLines, flattenBlocks, defaultCollapsed, resetBlockCache, type Block } from "../src/ui/blocks.js";
 
 test("markdown block：按渲染期宽度折行——同一 block 两种宽度产出不同行（resize 重排的证据）", () => {
   const b: Block = { id: 1, kind: "markdown", source: "这是一段比较长的中文内容 ".repeat(12) };
@@ -51,6 +51,15 @@ test("flattenBlocks：行数组与 owner 映射对齐，block 间空行", () => 
   assert.equal(lines.length, owner.length);
   assert.equal(lines.filter((l) => l === "").length, 2, "每 block 一条间隔空行");
   assert.ok(owner.every((id) => id === 10 || id === 11));
+});
+
+test("resetBlockCache 使旧缓存失效（/rewind 重建后 id 重计不再串号）", () => {
+  const md = { id: 2, kind: "markdown", source: "旧内容" } as never as Block;
+  renderLines(md, 80); // 旧世界缓存 id=2
+  resetBlockCache(); // rewind 重建
+  const user = { id: 2, kind: "user", text: "新内容" } as never as Block;
+  const got = renderLines(user, 80);
+  assert.ok(got[0]!.includes("新内容"), "重建后同 id 应渲染新内容（曾拿到旧 markdown 行——'复述'根因）");
 });
 
 test("折叠切换使缓存失效（collapsed 进缓存键）", () => {

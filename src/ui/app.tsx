@@ -11,7 +11,7 @@ import { createRunQueue } from "./run-queue.js";
 import { ctrlCAction } from "./keybinds.js";
 import { getSandboxStatus } from "../sandbox/exec.js";
 import { explainApiError } from "../kernel/errors.js";
-import { defaultCollapsed, flattenBlocks, type Block, type NewBlock, type ToolBody } from "./blocks.js";
+import { defaultCollapsed, flattenBlocks, resetBlockCache, type Block, type NewBlock, type ToolBody } from "./blocks.js";
 import { visible, scrollBy } from "./viewport.js";
 import type { MouseEvent, MouseStdin } from "./terminal-io.js";
 import { wrapVisible, visibleWidth } from "./markdown.js";
@@ -487,6 +487,7 @@ export function App({
     try {
       await agent.rewindTo(item.turn!.parentTip);
       const entries = await agent.conversationEntries();
+      resetBlockCache(); // block id 从头重计：不翻新代数会撞旧缓存 key、渲染出旧内容
       const banner = blocksRef.current[0]; // banner block 保留
       idRef.current = 1;
       const replayed = replayBlocks(entries).map((b) => ({ ...b, id: idRef.current++ }) as Block);

@@ -101,9 +101,18 @@ export function renderBlockLines(b: Block, width: number): string[] {
 
 /** (id, width) → 行 的记忆化缓存：resize 只重算一次，滚动/重绘零成本。block 列表只增不删，缓存随之增长（行字符串，可接受）。 */
 const cache = new Map<string, string[]>();
+/** 缓存代数：/rewind 重建 transcript 时 block id 从头重计，会与旧 block 撞 key 拿到
+ *  渲染错内容的旧行（实测"复述上一轮回复"的根因）。重建前 bump 代数使旧缓存全部失效。 */
+let generation = 0;
+
+/** 丢弃全部缓存行（block 列表整体重建时调用——目前仅 /rewind）。 */
+export function resetBlockCache(): void {
+  generation += 1;
+  cache.clear();
+}
 
 export function renderLines(b: Block, width: number): string[] {
-  const key = `${b.id}:${width}:${b.kind === "tool" ? (b.collapsed ? "c" : "e") : ""}`;
+  const key = `${generation}:${b.id}:${width}:${b.kind === "tool" ? (b.collapsed ? "c" : "e") : ""}`;
   let lines = cache.get(key);
   if (!lines) {
     lines = renderBlockLines(b, width);
