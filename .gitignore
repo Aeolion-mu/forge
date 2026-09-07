@@ -1,0 +1,10 @@
+node_modules/
+.forge/
+.env
+.env.*
+test_project/
+*.log
+forge.config.json
+*.pem
+.scratch/
+.DS_Store
