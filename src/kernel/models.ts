@@ -18,6 +18,12 @@ export interface CustomModelEntry {
   reasoning?: boolean;
   /** 取 API key 的环境变量名；内网免鉴权端点可不填（免 key）。 */
   apiKeyEnv?: string;
+  /**
+   * pi-ai openai-completions 兼容层覆盖（透传到 Model.compat），如
+   * `{"supportsDeveloperRole": false, "maxTokensField": "max_tokens"}`。
+   * 非 OpenAI 官方端点常需要（拒绝 developer 角色 / 不认 max_completion_tokens / 不认 store）。
+   */
+  compat?: Record<string, unknown>;
 }
 
 /** 单例 Models 实例（auth 由 provider 自解析，见各 provider 的 envApiKeyAuth）。 */
@@ -53,6 +59,7 @@ export function buildCustomModel(e: CustomModelEntry): Model<Api> {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: e.contextWindow,
     maxTokens: e.maxTokens ?? 8192,
+    ...(e.compat ? { compat: e.compat } : {}),
   } as Model<Api>;
 }
 

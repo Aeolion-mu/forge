@@ -174,9 +174,12 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
           return bad("contextWindow 应为正数");
         }
         // 未知字段报错（与 ssh 段同规矩：避免「配了却静默失效」）。
-        const KNOWN = new Set(["ref", "label", "baseUrl", "contextWindow", "maxTokens", "reasoning", "apiKeyEnv"]);
+        const KNOWN = new Set(["ref", "label", "baseUrl", "contextWindow", "maxTokens", "reasoning", "apiKeyEnv", "compat"]);
         const unknown = Object.keys(mm).filter((k) => !KNOWN.has(k));
         if (unknown.length) return bad(`未知字段 ${unknown.join(", ")}`);
+        if (mm.compat !== undefined && (typeof mm.compat !== "object" || mm.compat === null || Array.isArray(mm.compat))) {
+          return bad("compat 应为对象（openai-completions 兼容层覆盖）");
+        }
         customs.push({
           ref: mm.ref,
           ...(typeof mm.label === "string" ? { label: mm.label } : {}),
@@ -185,6 +188,7 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
           ...(typeof mm.maxTokens === "number" ? { maxTokens: mm.maxTokens } : {}),
           ...(typeof mm.reasoning === "boolean" ? { reasoning: mm.reasoning } : {}),
           ...(typeof mm.apiKeyEnv === "string" ? { apiKeyEnv: mm.apiKeyEnv } : {}),
+          ...(mm.compat ? { compat: mm.compat as Record<string, unknown> } : {}),
         });
       });
       out.customModels = customs;
