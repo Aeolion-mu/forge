@@ -5,7 +5,8 @@
 > 底层复用库的 agent 主循环 / 会话树 / streamFn，上层全部自研：
 > **权限沙箱 · 审计日志 · 上下文工程（记忆 + 压缩）· 子 Agent 编排 · 代码智能（tree-sitter + LSP）· 全链路可观测**。
 >
-> 规模：自研内核 `src/kernel` ~2000 行，含 UI / 工具层共 ~4.7k 行 TypeScript，22 个测试文件 / 121 个用例。
+> 规模：自研内核 `src/kernel` ~2000 行，含 UI / 工具层共 ~4.7k 行 TypeScript，24 个测试文件 / 235 个用例。
+> 2026-09：升级 pi-agent-core 0.85（异步工厂 + lane + Context 线程化）并重构沙箱为双平台硬沙箱（Linux bwrap / macOS sandbox-exec），Windows 支持已移除。
 
 ---
 
@@ -47,6 +48,15 @@ npx tsx src/index.ts "把 src 下的文件列出来并数一下行数"   # 一�
 切换优先级：环境变量 `FORGE_MODEL` > `forge.config.json` 的 `defaultModel` > 内置兜底。
 切模型时按 provider 动态解析 key；子 Agent 优先用更省的 `deepseek-v4-flash`，缺 key 时回退主模型。
 
+内网/自建 **OpenAI 兼容端点**走 `customModels` 段（免 key 端点也可；`compat` 覆盖非 OpenAI 官方的差异）：
+
+```json
+"customModels": [
+  { "ref": "glm/glm-5.2", "baseUrl": "http://10.0.0.1/v1", "contextWindow": 200000,
+    "reasoning": true, "compat": { "supportsDeveloperRole": false, "maxTokensField": "max_tokens" } }
+]
+```
+
 ### 斜杠命令（交互式 TUI 内）
 
 ```
@@ -81,13 +91,26 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 `FORGE_RESERVE_TOKENS` · `FORGE_KEEP_RECENT_TOKENS` · `FORGE_MAX_RETRIES` · `FORGE_MAX_RETRY_DELAY_MS` ·
 `FORGE_TIMEOUT_MS` · `FORGE_ALLOW_READ_OUTSIDE` · `FORGE_ALLOW_WRITE_OUTSIDE` · `FORGE_SUBAGENT_MAX_TURNS` · `FORGE_AUTO_DIAGNOSE_TIMEOUT_MS` · `FORGE_CONVERGENT_MAX_TURNS`。
 
-### 写边界（自主写代码的护栏）
+### 写边界（内核保证，不再是正则假墙）
 
-写文件的工具（`write_file`/`edit_file`/`apply_patch`）由 `safePath` **锁死在 workdir** 内。`bash` 则额外过一道
-**best-effort 写边界守卫**：尽力拦住「往 workdir 外写」——重定向(`>`/`>>`)出界、写命令(`cp`/`mv`/`Copy-Item`…)目标出界、
-先 `cd ..` 再写，命中即 `deny`（即便 autoApprove / Convergent 也拦）。**诚实边界**：shell 解析是对抗性难题，这不是真墙
-（拦不住 `curl -o /外面`、`git config --global` 这类隐式写家目录、env 变量/子壳混淆的路径），真要 airtight 需 OS 级隔离（容器/VM）；
-配合「每条 bash 全量落审计 `.forge/audit.jsonl`」+ 用户复核兜底。确需越界写设 `FORGE_ALLOW_WRITE_OUTSIDE=1` 关闭守卫。
+写文件的工具（`write_file`/`edit_file`/`apply_patch`）由 `safePath` 锁死在 workdir 内；`bash` 的写边界由**内核**保证——
+2026-09 重构后，旧的两层 best-effort 守卫（正则写边界 + flash 语义裁决）已删，取而代之的是双平台硬沙箱：
+
+| | Linux（bwrap） | macOS（sandbox-exec / Seatbelt） |
+|---|---|---|
+| 只读根 + 可写白名单 | `--ro-bind / /` + `--bind` 白名单 | `(deny file-write*)` + `(allow … (subpath …))` |
+| 读隐藏（`~/.ssh` 等） | 空 tmpfs 盖住 | `(deny file-read* (subpath …))` |
+| 断网开关 | `--unshare-net` | `(deny network*)` |
+| 私有 /tmp | `--tmpfs /tmp` | 每会话独立 `$TMPDIR` |
+| 内存 / 进程限额 | systemd cgroup（MemoryMax/TasksMax）；无 systemd 只隔离不限内存 | **无**（SBPL 无资源限制原语；`ulimit -v` 在 mac 失效）；`ulimit -u` 部分生效 |
+| 环境白名单 | `--clearenv` + 13 变量白名单 | `env -i` + 同一份白名单 |
+
+- 默认可写：workdir、`/tmp`、`~/.cache/.npm/.cargo`（**`~/.config` 已收紧**——`git config --global` / `gh hosts.yml` 在里面，确需可写进 `sandbox.writePaths` 显式配）。
+- 默认禁读：`~/.ssh`、`~/.aws`、`~/.gnupg`（防「沙箱内读 key 后经网络外传」；全盘默认可读 + 默认联网是真实外泄面）。
+- 被拒的写以 `EPERM / Operation not permitted` 出现在 bash 输出里，模型看得见并会自行调整。
+- 豁免名单（`sandbox.excluded`）：沙箱内不可嵌套沙箱（`brew` / `swift test` 这类自带沙箱的工具）——命中则不沙箱执行 + 输出前置警告 + 审计。
+- 无后端可用时**大声降级**（启动横幅 + TUI 仪表盘显示「⚠ 未沙箱」），不再是静默 no-op。
+- 诚实边界：bwrap 共享宿主内核（不防内核 0-day 提权，那是 gVisor/microVM 的活）；seatbelt 是 Apple 名义 deprecated 但自家守护进程都在用的成熟机制（Claude Code / Cursor / Bazel / Homebrew 同款），风险在跨版本行为漂移（内层 shell 钉 `/bin/bash` 规避 zsh 5.9 的 sysctl 坑）。
 
 ---
 
@@ -99,11 +122,11 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
                  ┌──────────────── ForgeAgent（自研内核）─────────────────┐
    你的输入 ───▶ │  pi-agent-core AgentHarness（复用主循环 / 会话树 / streamFn） │
                  │     │                                                       │
-                 │     ├─ on("tool_call")     ─▶ PermissionPolicy（权限闸门）  │──▶ AuditLog
-                 │     ├─ on("tool_result")   ─▶ 审计 + 编辑后自动 LSP 诊断     │──▶ (.forge/audit.jsonl)
-                 │     ├─ on("context")       ─▶ 记录上下文 token（供压缩触发）  │
-                 │     ├─ on("session_before_compact") ─▶ 自研压缩（接管库原语） │
-                 │     └─ subscribe()         ─▶ Telemetry + Ink TUI 渲染        │
+                 │     ├─ hooks.before_tool  ─▶ PermissionPolicy（权限闸门）   │──▶ AuditLog
+                 │     ├─ hooks.after_tool    ─▶ 审计 + 编辑后自动 LSP 诊断      │──▶ (.forge/audit.jsonl)
+                 │     ├─ hooks.transform_context ─▶ 飞行记录的 context 管线    │
+                 │     ├─ hooks.before_compaction  ─▶ 自研压缩（接管库原语）     │
+                 │     └─ events.on(全类型)   ─▶ Telemetry + Ink TUI 渲染        │
                  │                                                              │
                  │  systemPrompt: 主提示 + 环境块(sh) + skills + 记忆索引                │
                  │  tools: 文件读写 / 搜索 / 代码智能 / bash / 子 Agent 编排        │
@@ -113,8 +136,11 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 | 文件 | 职责 |
 |---|---|
 | `src/kernel/forge-agent.ts` | 内核：包 `AgentHarness`，注入全部钩子、子 Agent 编排、压缩触发策略与熔断 |
-| `src/kernel/permission.ts` | 权限闸门：灾难命令硬拒绝 + 只读放行 + 写/执行确认 |
-| `src/sandbox/exec.ts` | 沙箱执行：剔除密钥环境变量、关 stdin、超时杀整棵进程树、输出上限截断 |
+| `src/kernel/permission.ts` | 权限闸门：灾难命令硬拒绝 + 只读放行 + 写/执行确认（写边界在沙箱内核层）|
+| `src/sandbox/policy.ts` | 沙箱策略单一事实源：writePaths / readDeny / excluded / 限额（含默认值）|
+| `src/sandbox/exec.ts` | 执行层：平台路由（bwrap/seatbelt/降级）、白名单环境、进程组杀、输出上限 |
+| `src/sandbox/bwrap.ts` | Linux 硬沙箱（只读根 + tmpfs 盖敏感目录 + cgroup 限额）|
+| `src/sandbox/seatbelt.ts` | macOS 硬沙箱（SBPL profile 生成 + env -i 白名单 + 钉 /bin/bash）|
 | `src/kernel/audit.ts` | 结构化审计日志（JSONL） |
 | `src/kernel/compaction.ts` | 上下文压缩纯逻辑：turn 对齐裁剪点 + 9 段摘要模板 + map-reduce 兜底 |
 | `src/kernel/memory.ts` | 多文件记忆：`MEMORY.md` 索引常驻注入，`<name>.md` 按需召回（项目 + 全局双作用域）|
@@ -133,12 +159,13 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 
 ## 六个核心能力，对应 AgentHarness 的哪个口子
 
-1. **权限沙箱（`on("tool_call")` + `sandbox/exec.ts`）** — 工具调用不是模型说了算，先过一道确定性闸门：
-   `rm -rf /`、`mkfs`、fork bomb、`curl|sh` 等直接拒绝
-   （即便 `/pass-permissions` 也硬拦）；写/执行类工具触发用户确认；只读工具放行。
-   执行层再隔离一道：子进程**剔除所有像密钥的环境变量**（防 `echo $env:*_API_KEY` 泄密）、关 stdin、超时杀整棵进程树。
-2. **审计日志（`on("tool_call")` / `on("tool_result")`）** — 每一次「决策 / 调用 / 结果」落成结构化 JSONL（`.forge/audit.jsonl`），可事后复盘。
-3. **上下文工程（systemPrompt 注入 + `on("session_before_compact")`）** — 会话开头注入持久记忆索引（`.forge/memory` 项目 + 全局双作用域）；
+1. **权限沙箱（`hooks.before_tool` + `sandbox/*`）** — 工具调用不是模型说了算，先过一道确定性闸门：
+   `rm -rf /`、`mkfs`、fork bomb、`curl|sh` 等直接拒绝（即便 `/pass-permissions` 也硬拦）；
+   写/执行类工具触发用户确认；只读工具放行。
+   执行层是**双平台内核级硬沙箱**（Linux bwrap / macOS sandbox-exec：只读根 + 可写白名单 + 敏感目录读隐藏 + 断网开关），
+   环境走白名单模型（密钥类变量根本不进子进程）、关 stdin、超时杀整棵进程树、输出上限截断。
+2. **审计日志（`hooks.before_tool` / `hooks.after_tool`）** — 每一次「决策 / 调用 / 结果」落成结构化 JSONL（`.forge/audit.jsonl`），可事后复盘。
+3. **上下文工程（systemPrompt 注入 + `hooks.before_compaction`）** — 会话开头注入持久记忆索引（`.forge/memory` 项目 + 全局双作用域）；
    超 90% 窗口时接管库的压缩原语，用自研 cut point（对齐 turn 边界、留近端 ~20% 窗口）+ 9 段 coding 向摘要，
    prompt 过长时 **map-reduce 二分兜底**（不盲丢最早历史），连续失败 3 次熔断防空烧 API。
 4. **子 Agent 编排（自定义工具 + 递归 Harness，fire-and-forget）** — `spawn_subagent` 把子任务派给隔离子 Agent：
@@ -146,7 +173,7 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
    完成后结论经串行队列自动喂回主 Agent —— 经典 orchestrator-worker。
 5. **代码智能（tree-sitter + LSP）** — `outline`/`repo_map` 先看结构再精读；`definition`/`references`/`hover`/`rename` 走 LSP（跨文件、比 grep 准）；
    **编辑后自动诊断**：写类工具成功后对受影响文件跑 LSP，有 error 就追加进工具结果让模型立即看到。
-6. **全链路可观测（`subscribe()`）** — 订阅事件流，实时流式渲染 +
+6. **全链路可观测（`events.on` 全类型扇出）** — 订阅事件流，实时流式渲染 +
    沉淀 token / 成本（按国产模型真实定价算人民币）/ prompt 缓存命中率 / 各工具调用次数与时延的 trace。
 
 ---
@@ -154,9 +181,10 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 ## 写进简历的 bullet（可直接改）
 
 - 基于 `pi-agent-core`（OpenClaw 的底层 agent runtime）的 `AgentHarness` 自研轻量**编程 Agent 框架内核 Forge**，
-  自研内核 ~2000 行 / 共 ~4.7k 行 TypeScript（121 个单测），复刻最新一代编程 Agent 的核心机制。
-- 实现**权限沙箱**：在 `tool_call` 钩子上做确定性策略闸门（灾难命令黑名单 + 只读放行 + 写操作确认），
-  工具调用无法绕过；执行层再隔离（剔密钥环境变量 / 超时杀进程树），配套结构化 **JSONL 审计日志**。
+  自研内核 ~2000 行 / 共 ~4.7k 行 TypeScript（235 个单测），复刻最新一代编程 Agent 的核心机制。
+- 实现**权限沙箱**：在 before_tool 钩子上做确定性策略闸门（灾难命令黑名单 + 只读放行 + 写操作确认），
+  执行层为**双平台内核级硬沙箱**（Linux bwrap 只读根+cgroup / macOS sandbox-exec SBPL，读隐藏敏感目录 + 断网开关 +
+  白名单环境），配套结构化 **JSONL 审计日志**；无后端时大声降级而非静默放行。
 - 设计**上下文工程层**：多文件记忆索引常驻注入 + 按需召回；超 90% 窗口接管压缩（turn 对齐裁剪 + 9 段摘要 +
   prompt 过长 map-reduce 兜底 + 连续失败熔断），对齐长上下文与记忆架构方案。
 - 实现 **fire-and-forget 子 Agent 编排**：主 Agent 派发隔离子 Agent（异步不阻塞、flash 省钱模型、受限工具集、防递归），
@@ -169,8 +197,8 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 ## 它不是什么（诚实边界）
 
 - 压缩是启发式的 cut point + 模型生成摘要；不追求与库 `compact()` 逐字节一致，目的在演示「何时压 / 压哪段 / 怎么兜底」的策略。
-- 权限模型是教学级：纯 Node、无容器，**限不了 CPU/内存、拦不住网络、挡不住往任意绝对路径写**，
-  做到的是「隔离 + 防密钥泄漏 + 健壮」。真实场景需 seccomp / 容器 / VM 级隔离。
+- 沙箱已到内核级写边界（bwrap / seatbelt），但**不防内核 0-day 提权**（共享宿主内核，那是 gVisor/microVM 的活）；
+  macOS 无内存限额机制（SBPL 无资源限制原语）；沙箱不可嵌套（brew 等走豁免名单）。bwrap 的 Linux 实机验证待有 Linux 环境后补跑（单测已覆盖参数构造）。
 - LSP 只接了 Python / TS-JS 两类 server；加语言需同时改 `lsp-client.ts` 的 `SERVERS`、`package.json` 依赖与 tree-sitter wasm。
 - 目的：**展示对 agent runtime 内部机制的理解**，而非替代成品编程 Agent。
 
