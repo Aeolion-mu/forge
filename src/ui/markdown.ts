@@ -21,7 +21,8 @@ function termCols(): number {
 }
 
 /** 东亚宽字符 / emoji → 宽度 2，其余 1。 */
-function isWide(cp: number): boolean {
+/** 字符是否占 2 列（CJK/emoji 等）。导出供选区/高亮等按可见列游走的模块复用。 */
+export function isWide(cp: number): boolean {
   return (
     (cp >= 0x1100 && cp <= 0x115f) ||
     (cp >= 0x2e80 && cp <= 0x303e) ||

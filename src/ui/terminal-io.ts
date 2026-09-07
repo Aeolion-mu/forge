@@ -15,8 +15,8 @@ import type { Readable } from "node:stream";
  */
 
 export interface MouseEvent {
-  /** press=按下（v1 的动作触发点）；wheel=滚轮；release=松开（v1 忽略）。 */
-  kind: "press" | "release" | "wheel";
+  /** press=按下；motion=按住拖动（1002h，b 第 5 位置位）；wheel=滚轮；release=松开。 */
+  kind: "press" | "release" | "wheel" | "motion";
   /** SGR 编码原始按键号：0=左键 1=中键 2=右键；滚轮 64=上 65=下。 */
   button: number;
   /** 1-based 列。 */
@@ -37,8 +37,9 @@ export function parseMouseSequence(s: string): MouseEvent | null {
   if (!m) return null;
   const b = Number(m[1]);
   const base = b & 3; // 低 2 位 = 按键（0=左 1=中 2=右）
+  const motion = (b & 32) !== 0;
   return {
-    kind: m[4] === "M" ? (b >= 64 ? "wheel" : "press") : "release",
+    kind: m[4] === "M" ? (b >= 64 ? "wheel" : motion ? "motion" : "press") : "release",
     button: b >= 64 ? b : base,
     col: Number(m[2]),
     row: Number(m[3]),
@@ -227,7 +228,7 @@ export class TerminalIo {
     if (this.active) return;
     this.active = true;
     // 顺序：先切备用屏（保存光标），再开鼠标/藏光标
-    const mouse = opts.mouse !== false ? `${ESC}[?1000h${ESC}[?1006h` : "";
+    const mouse = opts.mouse !== false ? `${ESC}[?1000h${ESC}[?1002h${ESC}[?1006h` : ""; // 1002=按住拖动上报（拖选）
     this.out.write(`${ESC}[?1049h${mouse}${ESC}[?25l`);
     const onSignal = () => {
       this.restore();
@@ -250,6 +251,6 @@ export class TerminalIo {
       process.removeListener(name, h);
     }
     this.handlers.length = 0;
-    this.out.write(`${ESC}[?1006l${ESC}[?1000l${ESC}[?25h${ESC}[?1049l`);
+    this.out.write(`${ESC}[?1006l${ESC}[?1002l${ESC}[?1000l${ESC}[?25h${ESC}[?1049l`);
   }
 }

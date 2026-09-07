@@ -14,8 +14,10 @@ import { explainApiError } from "../kernel/errors.js";
 import { defaultCollapsed, flattenBlocks, type Block, type NewBlock, type ToolBody } from "./blocks.js";
 import { visible, scrollBy } from "./viewport.js";
 import type { MouseEvent, MouseStdin } from "./terminal-io.js";
-import { wrapVisible } from "./markdown.js";
+import { wrapVisible, visibleWidth } from "./markdown.js";
 import { MultilineInput } from "./multiline-input.js";
+import { normalizeRange, lineRangeInSel, highlightRange, plainOf, expandWord, wholeLine, selectedText } from "./selection.js";
+import { copyText } from "./clipboard.js";
 
 // 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
 const WRITE_VERB: Record<string, string> = { edit_file: "Update", write_file: "Write" };
@@ -95,6 +97,14 @@ export function App({
   const [newCount, setNewCount] = useState(0);
   // 鼠标点击输入框 → 请求把光标移到该列（消费后置 null）。
   const [cursorCol, setCursorCol] = useState<number | null>(null);
+  // 应用内选区（全局行号 + 可见列；anchor→active 归一化后渲染高亮）。单击清空、拖拽/双击/三击建立。
+  const [sel, setSel] = useState<{ anchor: { line: number; col: number }; active: { line: number; col: number } } | null>(null);
+  const selRef = useRef<typeof sel>(sel);
+  selRef.current = sel;
+  // 拖拽进行时：起点与「是否真的拖动了」（没动 = 单击，动 = 选择）
+  const dragRef = useRef<{ startRow: number; startLine: number; startCol: number; moved: boolean } | null>(null);
+  // 双击/三击计数（<500ms 同格）
+  const lastClickRef = useRef<{ ts: number; row: number; col: number; count: number }>({ ts: 0, row: 0, col: 0, count: 0 });
   // 鼠标捕获开关：关掉后终端原生「拖拽选择 + 复制」恢复（forge 内滚轮/点击随之失效，
   // 键盘 PgUp/PgDn 滚动不受影响）。FORGE_NO_MOUSE=1 启动即关。
   const [mouseOn, setMouseOn] = useState(process.env.FORGE_NO_MOUSE !== "1");
@@ -102,7 +112,7 @@ export function App({
   // 鼠标捕获切换 → 写终端上报开关（TerminalIo.restore 退出时无条件关，幂等安全）
   const { stdout: ioOut } = useStdout();
   useEffect(() => {
-    ioOut.write(mouseOn ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1006l\x1b[?1000l");
+    ioOut.write(mouseOn ? "\x1b[?1000h\x1b[?1002h\x1b[?1006h" : "\x1b[?1006l\x1b[?1002l\x1b[?1000l"); // 1002=拖选
   }, [mouseOn, ioOut]);
 
   // 命令历史：↑/↓ 翻看已发出的命令。histIdx=null 表示在编辑新输入。
@@ -163,7 +173,7 @@ export function App({
     if (config.allowReadOutsideWorkdir) {
       lines.push(` ${ansi.amber("⚠ read-outside-workdir ON")} ${ansi.dim("— read-only tools may read outside workdir")}`);
     }
-    lines.push("", ansi.dim("滚轮/PgUp 回看历史 · 点击折叠的工具结果可展开 · 原生选择按住 Shift(或 Fn/Option) · /mouse 关闭鼠标捕获 · /exit 退出"));
+    lines.push("", ansi.dim("滚轮回看 · 点击折叠展开 · 拖拽选择松开即复制 · 双击选词/三击选行 · /mouse 关 · /exit 退出"));
     pushBlock({ kind: "banner", lines });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -313,6 +323,13 @@ export function App({
   // Ctrl+C 接管（始终生效）：确认中=拒绝 / 运行中=中止回到输入 / 有输入=清空 / 空输入按两次=退出
   useInput((ch, key) => {
     if (!(key.ctrl && ch === "c")) return;
+    // 选区激活且空闲 → Ctrl+C = 复制（Claude Code 语义）；运行中仍优先中止
+    const cur = selRef.current;
+    if (cur && !busy && working === null && confirm === null) {
+      void copySelectionNow(cur.anchor, cur.active);
+      setSel(null);
+      return;
+    }
     const action = ctrlCAction({
       confirm: confirm !== null,
       running: busy || working !== null,
@@ -342,6 +359,43 @@ export function App({
         break;
     }
   });
+
+  // 选区键盘互作：Esc 清选区；打字清选区；Shift+←/→ 移动活动端扩展（跨行边界）
+  useInput(
+    (input, key) => {
+      const cur = selRef.current;
+      if (key.escape) {
+        setSel(null);
+        return;
+      }
+      if (key.shift && (key.leftArrow || key.rightArrow)) {
+        if (!cur) return;
+        const lines = flatRef.current.lines;
+        let { line, col } = cur.active;
+        if (key.leftArrow) {
+          if (col > 0) col -= 1;
+          else if (line > 0) {
+            line -= 1;
+            col = visibleWidth(plainOf(lines[line] ?? ""));
+          }
+        } else {
+          const w = visibleWidth(plainOf(lines[line] ?? ""));
+          if (col < w) col += 1;
+          else if (line < lines.length - 1) {
+            line += 1;
+            col = 0;
+          }
+        }
+        setSel({ anchor: cur.anchor, active: { line, col } });
+        return;
+      }
+      // 任何可打印输入清选区（开始打字 = 放弃选择）
+      if (input && !key.ctrl && !key.meta && !key.return && !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow && !key.tab && !key.backspace && !key.delete) {
+        setSel(null);
+      }
+    },
+    { isActive: confirm === null },
+  );
 
   // 确认提示按键：回车/Y = 同意，n = 拒绝
   useInput(
@@ -583,7 +637,20 @@ export function App({
     setBlocks((prev) =>
       prev.map((b) => (b.id === toolCallIdOrBlockId && b.kind === "tool" && b.body ? { ...b, collapsed: !b.collapsed } : b)),
     );
+    setSel(null); // 折叠切换会让行号重排，选区失效
   }, []);
+
+  /** 复制当前选区（copy-on-select；FORGE_COPY_ON_SELECT=0 关闭自动、只留 Ctrl+C 手动）。 */
+  const copySelectionNow = useCallback(
+    async (anchor: { line: number; col: number }, active: { line: number; col: number }) => {
+      if (process.env.FORGE_COPY_ON_SELECT === "0") return;
+      const text = selectedText(flatRef.current.lines, normalizeRange(anchor, active));
+      if (!text.trim()) return;
+      const r = await copyText(text);
+      push(ansi.dim(`⧉ 已复制 ${text.length} 字符 → ${r.path}${r.note ? `（${r.note}）` : ""}`));
+    },
+    [push],
+  );
 
   useEffect(() => {
     return mouseStdin.onMouseEvent((ev: MouseEvent) => {
@@ -597,35 +664,111 @@ export function App({
         });
         return;
       }
-      if (ev.kind !== "press" || ev.button !== 0) return; // v1 只处理左键点击
+      if (ev.button !== 0) return; // v1 只处理左键（选择/点击）
       const z = zonesRef.current;
-      if (z.jumpRow === ev.row) return jumpToBottom();
-      if (z.menuTop !== null && ev.row >= z.menuTop && ev.row < z.menuTop + menuMatches.length) {
-        setMenuIdx(ev.row - z.menuTop);
+      const inViewport = ev.row >= 1 && ev.row <= z.viewportRows;
+      /** 屏幕行 → 全局行（可带 offset 覆盖：边缘自动滚后按新视口算） */
+      const lineUnder = (row: number, offsetOverride?: number) => {
+        const v = visible({ total, height: viewportHeightRef.current, offset: offsetOverride ?? scrollOffsetRef.current });
+        return v.start + (row - 1);
+      };
+      const textCol = (col: number) => Math.max(0, col - 1); // 屏幕 1-based → 行内 0-based 可见列
+
+      // ── 按下：记拖拽起点（视口内才可能拖选；先不动作，等松开区分单击/拖拽）──
+      if (ev.kind === "press") {
+        dragRef.current = inViewport
+          ? { startRow: ev.row, startLine: lineUnder(ev.row), startCol: textCol(ev.col), moved: false }
+          : null;
         return;
       }
-      if (z.inputRow === ev.row && confirm === null) {
-        setCursorCol(Math.max(0, ev.col - 2)); // `› ` 前缀占 2 列
+
+      // ── 拖动：跨格才算选择；拖到视口上下边缘自动滚 1 行 ──
+      if (ev.kind === "motion") {
+        const d = dragRef.current;
+        if (!d) return;
+        if (!d.moved && (ev.row !== d.startRow || ev.col !== d.startCol)) d.moved = true;
+        if (!d.moved) return;
+        let offset = scrollOffsetRef.current;
+        if (ev.row <= 1) {
+          offset = scrollBy({ total, height: viewportHeightRef.current, offset }, 1);
+          setScrollOffset(offset);
+        } else if (ev.row >= z.viewportRows) {
+          offset = scrollBy({ total, height: viewportHeightRef.current, offset }, -1);
+          if (offset === 0) setNewCount(0);
+          setScrollOffset(offset);
+        }
+        setSel({ anchor: { line: d.startLine, col: d.startCol }, active: { line: lineUnder(ev.row, offset), col: textCol(ev.col) } });
         return;
       }
-      if (ev.row <= z.viewportRows && ev.row >= 1) {
-        // 视口行 → 展开后的行下标 → 所属 block
-        const lineIdx = visStartRef.current + (ev.row - 1);
-        const blockId = flatRef.current.owner[lineIdx];
-        if (blockId !== undefined) {
-          const b = blocksRef.current.find((x) => x.id === blockId);
-          if (b?.kind === "tool" && b.body) toggleToolBlock(b.id);
+
+      // ── 松开 ──
+      if (ev.kind === "release") {
+        const d = dragRef.current;
+        dragRef.current = null;
+        if (d?.moved) {
+          // 拖拽结束：定格选区 + 松开即复制
+          const anchor = { line: d.startLine, col: d.startCol };
+          const active = { line: lineUnder(ev.row), col: textCol(ev.col) };
+          setSel({ anchor, active });
+          void copySelectionNow(anchor, active);
+          return;
+        }
+        // 单击：先双击/三击判定（同格 <500ms）——二击选词、三击选行，选中即复制
+        const lc = lastClickRef.current;
+        const same = lc.row === ev.row && lc.col === ev.col && Date.now() - lc.ts < 500;
+        const count = same ? lc.count + 1 : 1;
+        lastClickRef.current = { ts: Date.now(), row: ev.row, col: ev.col, count: count >= 3 ? 0 : count };
+        if (inViewport) {
+          const lineIdx = lineUnder(ev.row);
+          const lineText = flatRef.current.lines[lineIdx];
+          if (lineText !== undefined && count >= 2) {
+            const plain = plainOf(lineText);
+            const [c0, c1] = count === 2 ? expandWord(plain, textCol(ev.col)) : wholeLine(plain);
+            const anchor = { line: lineIdx, col: c0 };
+            const active = { line: lineIdx, col: c1 };
+            setSel({ anchor, active });
+            void copySelectionNow(anchor, active);
+            return;
+          }
+          setSel(null); // 普通单击清选区
+        }
+        // 既有单击路由：Jump 按钮 / 菜单 / 输入框定位 / 工具折叠
+        if (z.jumpRow === ev.row) return jumpToBottom();
+        if (z.menuTop !== null && ev.row >= z.menuTop && ev.row < z.menuTop + menuMatches.length) {
+          setMenuIdx(ev.row - z.menuTop);
+          return;
+        }
+        if (z.inputRow === ev.row && confirm === null) {
+          setCursorCol(Math.max(0, ev.col - 2)); // `› ` 前缀占 2 列
+          return;
+        }
+        if (inViewport) {
+          const lineIdx = lineUnder(ev.row);
+          const blockId = flatRef.current.owner[lineIdx];
+          if (blockId !== undefined) {
+            const b = blocksRef.current.find((x) => x.id === blockId);
+            if (b?.kind === "tool" && b.body) toggleToolBlock(b.id);
+          }
         }
       }
     });
-  }, [mouseStdin, confirm, menuMatches.length, jumpToBottom, toggleToolBlock]);
+  }, [mouseStdin, confirm, menuMatches.length, jumpToBottom, toggleToolBlock, copySelectionNow]);
 
   const visStartRef = useRef(vis.start);
   visStartRef.current = vis.start;
   const blocksRef = useRef(blocks);
   blocksRef.current = blocks;
 
-  const viewportText = flat.lines.slice(vis.start, vis.start + vis.count).join("\n");
+  // 视口行 + 选区高亮（区间内选择性反显；中间行整行 = [0, ∞)）
+  const selRange = sel ? normalizeRange(sel.anchor, sel.active) : null;
+  const viewportText = flat.lines
+    .slice(vis.start, vis.start + vis.count)
+    .map((l, i) => {
+      if (!selRange) return l;
+      const rng = lineRangeInSel(selRange, vis.start + i);
+      return rng ? highlightRange(l, rng[0], rng[1]) : l;
+    })
+    .join("\n");
 
   return (
     <Box flexDirection="column">
