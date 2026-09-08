@@ -1046,8 +1046,8 @@ export function App({
       if (process.env.FORGE_COPY_ON_SELECT === "0") return;
       const text = selectedText(screenRef.current.lines, normalizeRange(anchor, active));
       if (!text.trim()) return;
-      const r = await copyText(text);
-      setToast(`⧉ 已复制 ${text.length} 字符 → ${r.path}`);
+      await copyText(text); // 路径（pbcopy/OSC52/…）不进提示——用户只关心复制成功
+      setToast(`⧉ 已复制 ${text.length} 字符`);
     },
     [],
   );
@@ -1058,8 +1058,8 @@ export function App({
       if (process.env.FORGE_COPY_ON_SELECT === "0") return;
       const text = inputRef.current.slice(Math.min(anchor, active), Math.max(anchor, active));
       if (!text.trim()) return;
-      const r = await copyText(text);
-      setToast(`⧉ 已复制输入框 ${text.length} 字符 → ${r.path}`);
+      await copyText(text);
+      setToast(`⧉ 已复制输入框 ${text.length} 字符`);
     },
     [],
   );
