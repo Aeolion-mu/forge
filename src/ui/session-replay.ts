@@ -1,7 +1,7 @@
 import type { Entry } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
-import { defaultCollapsed, type NewBlock } from "./blocks.js";
+import { defaultCollapsed, type NewBlock, type ThoughtTool } from "./blocks.js";
 import { ansi } from "./theme.js";
 
 /**
@@ -11,10 +11,16 @@ import { ansi } from "./theme.js";
  * 会话树本体不动（同一 JSONL 继续追加）。宽度层面的折行由 blocks.ts 渲染期现算，
  * 跟随当前终端宽度（这是显示，不是数据）。
  *
+ * 回合分组：两条 user 消息之间的 assistant 内容（thinking + toolCall + text）收进一个
+ * thought 摘要块（与 live 行为对齐：读类工具折叠进摘要，仅写类单独成块）。
+ *
  * 已知近似（诚实边界）：session 里没有 UI 的 FileDiff details，diff 类工具结果按
- * 纯文本回放（toolResult.content 全文在，折叠展开可用）；turn 页脚（N 秒 · N token）
- * 属瞬态数据不重放。
+ * 纯文本回放（toolResult.content 全文在，折叠展开可用）；回合时长属瞬态数据不重放
+ * （thought 摘要行省略时长段）。
  */
+
+/** 回放时折叠进 thought 摘要的工具名（写类仍单独成块）。 */
+const REPLAY_FOLD_TOOLS = new Set(["read_file", "grep", "glob", "list_dir", "bash", "ssh_run", "outline", "repo_map", "definition", "references", "hover", "rename", "diagnostics", "memory_read", "memory_write", "spawn_subagent", "subagent_list", "subagent_cancel", "subagent_steer"]);
 
 const textOfContent = (content: unknown): string => {
   if (typeof content === "string") return content;
@@ -30,11 +36,27 @@ const previewOf = (s: string, n = 80): string => s.split("\n")[0]?.slice(0, n) ?
 /** 条目 → Block[]。id 由调用方（pushBlock）分配；这里返回不带 id 的净荷。 */
 export function replayBlocks(entries: Entry[]): NewBlock[] {
   const out: NewBlock[] = [];
-  /** 等待结果回填的 tool block 下标（toolCallId → out 下标）。 */
+  /** 等待结果回填的 tool block 下标（toolCallId → out 下标，写类工具）。 */
   const pending = new Map<string, number>();
+  /** 折叠进 thought 的工具记录（toolCallId → 记录；toolResult 回填 preview）。 */
+  const pendingTools = new Map<string, ThoughtTool>();
+  /** 当前回合累积器（两条 user 消息之间）：thinking 全文 + 折叠工具记录。 */
+  let thought: { thinking: string; tools: ThoughtTool[] } | null = null;
+
+  /** 回合收尾：产出 thought 摘要块（与 live 同位——插在回合最终回复之前）。 */
+  const flushThought = () => {
+    if (thought && (thought.thinking || thought.tools.length)) {
+      const last = out[out.length - 1];
+      const at = last?.kind === "markdown" ? out.length - 1 : out.length;
+      out.splice(at, 0, { kind: "thought", secs: 0, thinking: thought.thinking, tools: thought.tools });
+    }
+    thought = null;
+    pendingTools.clear();
+  };
 
   for (const e of entries) {
     if (e.type === "compaction") {
+      flushThought();
       out.push({ kind: "plain", text: ansi.dim(`↻ 已压缩会话前段（保留摘要 ${e.summary.length} 字）`) });
       pending.clear(); // 压缩前的 tool 配对已无意义
       continue;
@@ -43,12 +65,20 @@ export function replayBlocks(entries: Entry[]): NewBlock[] {
     const msg = e.message as Message;
 
     if (msg.role === "user") {
+      flushThought(); // user 消息 = 回合边界
       out.push({ kind: "user", text: textOfContent(msg.content) });
+      thought = { thinking: "", tools: [] };
       continue;
     }
     if (msg.role === "toolResult") {
-      const idx = pending.get(msg.toolCallId);
       const text = textOfContent(msg.content);
+      const rec = pendingTools.get(msg.toolCallId);
+      if (rec) {
+        if (text) rec.preview = previewOf(text);
+        pendingTools.delete(msg.toolCallId);
+        continue;
+      }
+      const idx = pending.get(msg.toolCallId);
       if (idx !== undefined) {
         const b = out[idx]!;
         if (b.kind === "tool") {
@@ -63,24 +93,30 @@ export function replayBlocks(entries: Entry[]): NewBlock[] {
       continue;
     }
     if (msg.role === "assistant") {
+      if (!thought) thought = { thinking: "", tools: [] }; // 回放可能直接从 assistant 开始（无前导 user）
       for (const c of msg.content) {
         const x = c as { type: string; text?: string; thinking?: string; name?: string; id?: string; arguments?: unknown };
         if (x.type === "thinking" && x.thinking) {
-          out.push({ kind: "thinking", tokens: Math.round(x.thinking.length / 4) });
+          thought.thinking += (thought.thinking ? "\n\n" : "") + x.thinking;
         } else if (x.type === "text" && x.text) {
           out.push({ kind: "markdown", source: x.text });
         } else if (x.type === "toolCall" && x.name) {
           const argsSummary = summarizeArgs(x.name, x.arguments);
-          out.push({
-            kind: "tool",
-            toolCallId: x.id ?? "",
-            header: `${ansi.tool("●")} \x1b[1m${x.name}\x1b[0m${ansi.dim(`(${argsSummary})`)}`,
-          });
-          if (x.id) pending.set(x.id, out.length - 1);
+          const header = `${ansi.tool("●")} \x1b[1m${x.name}\x1b[0m${ansi.dim(`(${argsSummary})`)}`;
+          if (REPLAY_FOLD_TOOLS.has(x.name)) {
+            // 读类：折叠进 thought（与 live turn_end 折叠行为对齐）
+            const rec: ThoughtTool = { name: x.name, header, toolCallId: x.id };
+            thought.tools.push(rec);
+            if (x.id) pendingTools.set(x.id, rec);
+          } else {
+            out.push({ kind: "tool", toolCallId: x.id ?? "", header });
+            if (x.id) pending.set(x.id, out.length - 1);
+          }
         }
       }
     }
   }
+  flushThought(); // 末回合收尾
   return out;
 }
 

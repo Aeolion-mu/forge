@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Box, Text, useApp, useInput, useStdout, useWindowSize } from "ink";
 import type { HarnessEvent } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { renderMarkdown } from "./markdown.js";
 import { summarizeToolArgs, readFileResultLine } from "./render.js";
 import { theme, ansi, sparkFrame, SPARK_REST, renderBanner } from "./theme.js";
@@ -11,10 +10,10 @@ import { createRunQueue } from "./run-queue.js";
 import { ctrlCAction } from "./keybinds.js";
 import { getSandboxStatus } from "../sandbox/exec.js";
 import { explainApiError } from "../kernel/errors.js";
-import { defaultCollapsed, flattenBlocks, resetBlockCache, type Block, type NewBlock, type ToolBody } from "./blocks.js";
+import { defaultCollapsed, flattenBlocks, resetBlockCache, type Block, type NewBlock, type ToolBody, type ThoughtTool } from "./blocks.js";
 import { visible, scrollBy } from "./viewport.js";
 import type { MouseEvent, MouseStdin } from "./terminal-io.js";
-import { wrapVisible, visibleWidth } from "./markdown.js";
+import { wrapVisible, visibleWidth, truncateVisible } from "./markdown.js";
 import { MultilineInput } from "./multiline-input.js";
 import { normalizeRange, lineRangeInSel, highlightRange, plainOf, expandWord, wholeLine, selectedText } from "./selection.js";
 import { copyText } from "./clipboard.js";
@@ -74,6 +73,12 @@ function buildToolHeader(e: { toolName: string; args?: unknown }): string {
   return `${ansi.tool("●")} ${ansi.bold(e.toolName)}${ansi.dim(`(${summarizeToolArgs(e.toolName, e.args)})`)}`;
 }
 
+/** tool_end 结果体 → thought 展开明细的结果首行（diff 块本身保持可见，无需预览）。 */
+function thoughtPreview(body: ToolBody | undefined): string | undefined {
+  if (!body || body.kind !== "text") return undefined;
+  return body.preview ?? body.full?.split("\n")[0];
+}
+
 interface ConfirmReq {
   tool: string;
   args: unknown;
@@ -129,7 +134,6 @@ export function App({
   const [input, setInput] = useState("");
   const [confirm, setConfirm] = useState<ConfirmReq | null>(null);
   const [bypass, setBypass] = useState(agent.bypassingPermissions); // 启动默认 pass-permissions 开
-  const [, setTick] = useState(0);
   const [dash, setDash] = useState({ turns: 0, inTok: 0, outTok: 0, cost: 0, ctxUsed: 0, cacheHit: 0 });
   // 长操作进度（压缩等）：非 null 时在输入框上方显示动态状态行。
   const [working, setWorking] = useState<string | null>(null);
@@ -194,7 +198,7 @@ export function App({
   // 鼠标捕获切换 → 写终端上报开关（TerminalIo.restore 退出时无条件关，幂等安全）
   const { stdout: ioOut } = useStdout();
   useEffect(() => {
-    ioOut.write(mouseOn ? "\x1b[?1000h\x1b[?1002h\x1b[?1006h" : "\x1b[?1006l\x1b[?1002l\x1b[?1000l"); // 1002=拖选
+    ioOut.write(mouseOn ? "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h" : "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l"); // 1002=拖选 1003=悬停
   }, [mouseOn, ioOut]);
 
   // 命令历史：↑/↓ 翻看已发出的命令。histIdx=null 表示在编辑新输入。
@@ -212,6 +216,14 @@ export function App({
   const prevTotalRef = useRef(0); // 上一帧总行数（跟随暂停时累加新行数）
   const scrollOffsetRef = useRef(0);
   scrollOffsetRef.current = scrollOffset;
+  // 回合累积器（Claude Code 式「Thought for …」摘要块的 live 数据面）：message_start 建、
+  // tool_start/end 记工具、message_end 收思考、turn_end 折叠成块。中止（无 turn_end）即弃——
+  // 半途的现场块保持原样，诚实呈现「这回合没跑完」。
+  const thoughtRef = useRef<{ thinking: string; tools: ThoughtTool[] } | null>(null);
+  // 鼠标悬停中的 thought block id（折叠摘要行变白）。变化才 setState，避免逐像素重渲染。
+  const [hoverId, setHoverId] = useState<number | null>(null);
+  const hoverIdRef = useRef<number | null>(null);
+  hoverIdRef.current = hoverId;
 
   const pushBlock = useCallback((b: NewBlock) => {
     setBlocks((prev) => [...prev, { ...b, id: idRef.current++ } as Block]);
@@ -374,7 +386,9 @@ export function App({
           if ((e.message as { role?: string }).role === "assistant") {
             bufRef.current = "";
             thinkRef.current = "";
-            turnStartRef.current = Date.now();
+            // 整回合计时：首条消息定锚（中途工具循环的 message_start 不重置）
+            if (!turnStartRef.current) turnStartRef.current = Date.now();
+            if (!thoughtRef.current) thoughtRef.current = { thinking: "", tools: [] };
             setBusy(true);
           }
           break;
@@ -386,8 +400,11 @@ export function App({
         }
         case "message_end":
           if ((e.message as { role?: string }).role === "assistant") {
+            // 思考全文收进回合累积器（多段以空行相接）——不再丢弃，摘要行可展开查看
             const think = thinkRef.current.trim();
-            if (think) pushBlock({ kind: "thinking", tokens: Math.round(think.length / 4) });
+            if (think && thoughtRef.current) {
+              thoughtRef.current.thinking += (thoughtRef.current.thinking ? "\n\n" : "") + think;
+            }
             const t = bufRef.current.trim();
             if (t) pushBlock({ kind: "markdown", source: t });
             bufRef.current = "";
@@ -395,15 +412,31 @@ export function App({
           }
           break;
         case "turn_end": {
-          const secs = ((Date.now() - turnStartRef.current) / 1000).toFixed(1);
-          const out = (e.message as AssistantMessage | undefined)?.usage?.output ?? 0;
-          pushBlock({ kind: "turn", secs, out });
+          const th = thoughtRef.current;
+          thoughtRef.current = null;
+          const secs = turnStartRef.current ? (Date.now() - turnStartRef.current) / 1000 : 0;
+          turnStartRef.current = 0;
+          // 折叠成 Claude Code 式摘要行：读类（非 diff）工具块收进 thought（点开才见），
+          // 写类 diff 块保持可见；摘要行插在回合最终回复之前（无回复文本则追加末尾）。
+          setBlocks((prev) => {
+            const kept = prev.filter(
+              (b) =>
+                !(b.kind === "tool" && b.body?.kind !== "diff" && th?.tools.some((t) => t.toolCallId === b.toolCallId)),
+            );
+            if (!th || (!th.thinking && !th.tools.length)) return kept;
+            const blk: Block = { id: idRef.current++, kind: "thought", secs, thinking: th.thinking, tools: th.tools };
+            const last = kept[kept.length - 1];
+            const at = last?.kind === "markdown" ? kept.length - 1 : kept.length;
+            return [...kept.slice(0, at), blk, ...kept.slice(at)];
+          });
           const t = agent.telemetry;
           setDash({ turns: t.turns, inTok: t.inputTokens, outTok: t.outputTokens, cost: t.costRmb, ctxUsed: agent.contextTokens, cacheHit: t.cacheHitRate() });
           break;
         }
         case "tool_start": {
-          pushBlock({ kind: "tool", toolCallId: e.toolCallId, header: buildToolHeader(e) });
+          const header = buildToolHeader(e);
+          pushBlock({ kind: "tool", toolCallId: e.toolCallId, header });
+          thoughtRef.current?.tools.push({ name: e.toolName, header, toolCallId: e.toolCallId });
           break;
         }
         case "tool_end": {
@@ -423,6 +456,9 @@ export function App({
               ? [...prev, { id: idRef.current++, kind: "tool" as const, toolCallId: e.toolCallId, header: ansi.dim("(tool)"), body, collapsed: defaultCollapsed(body) }]
               : prev;
           });
+          // 结果首行回填回合累积器（摘要行展开明细用）
+          const rec = thoughtRef.current?.tools.find((t) => t.toolCallId === e.toolCallId);
+          if (rec) rec.preview = thoughtPreview(body);
           break;
         }
         case "compaction_end": {
@@ -433,6 +469,8 @@ export function App({
         }
         case "run_end":
           setBusy(false);
+          turnStartRef.current = 0;
+          thoughtRef.current = null; // 中止（无 turn_end）：累积器弃用，现场块保持原样
           break;
         default:
           break;
@@ -480,7 +518,8 @@ export function App({
     };
   }, [bridge, push, pushBlock, runMain, bumpSub, handleSubEvent]);
 
-  // busy 或长操作进行中：驱动 spinner / 状态行 / 计时刷新
+  // busy 或长操作进行中：驱动 spinner / 状态行 / 计时/思考流刷新
+  const [tick, setTick] = useState(0);
   useEffect(() => {
     if (!busy && !working) return;
     const id = setInterval(() => setTick((x) => x + 1), 120);
@@ -848,7 +887,7 @@ export function App({
   const frame = sparkFrame();
 
   const width = Math.max(20, termCols);
-  const flat = useMemo(() => flattenBlocks(blocks, width), [blocks, width]);
+  const flat = useMemo(() => flattenBlocks(blocks, width, "main", hoverId ?? undefined), [blocks, width, hoverId]);
   // 子 agent 实时清单（渲染期直读注册表；bumpSub/秒级 tick 驱动重渲染）。
   const subAgents = agent.listSubAgents();
   const subRunning = subAgents.filter((a) => a.status === "running");
@@ -858,11 +897,28 @@ export function App({
 
   // 当前查看上下文对应的 flat：主转录或某子 agent 的 transcript（ns 隔离渲染缓存）。
   // subTick 进 deps：transcript 只存在 ref 里，靠它感知新增 block。
-  const activeFlat = useMemo(() => {
+  const baseFlat = useMemo(() => {
     if (view.kind !== "sub") return flat;
     return flattenBlocks(subTranscriptsRef.current.get(view.id)?.blocks ?? [], width, `sub:${view.id}`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, flat, width, subTick]);
+
+  // 主上下文思考流：**跟随转录滚动**（追加在转录尾部，视口自动跟随）。此前它钉在输入框
+  // 上方的 chrome 段——流式增长让 chrome 高度每帧变化、视口边界来回挪动，与 Ink 差分
+  // 重绘叠加导致行间互相覆盖。现在 chrome 高度整个回合恒定；回合结束这些瞬态行随
+  // thought 折叠消失（思考全文在 thoughtRef 管线里）。tick（120ms）驱动流式刷新；
+  // owner=-1：不可点击/悬停，但可拖选复制（真实存在于 screen 行模型）。
+  const activeFlat = useMemo(() => {
+    if (view.kind !== "sub" && busy && thinkRef.current && !bufRef.current) {
+      const rl = wrapVisible(thinkRef.current.trim(), width - 4).split("\n").slice(-8);
+      if (rl.length) {
+        const extra = [ansi.dim(`${sparkFrame()} Reasoning`), ...rl.map((l) => ansi.dim(`  ${l}`)), ""];
+        return { lines: [...baseFlat.lines, ...extra], owner: [...baseFlat.owner, ...extra.map(() => -1)] };
+      }
+    }
+    return baseFlat;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseFlat, busy, tick, view]);
 
   // 状态行的已运行秒数走秒（无 running 时不开计时器——行也全部消失）。
   const anySubRunning = subRunning.length > 0;
@@ -875,13 +931,36 @@ export function App({
   // ── chrome 文本行模型 ───────────────────────────────────────────────────────
   // 视口上下的静态信息行统一转成 ANSI 文本行（aLines 在输入框上方、bLines 子视图头、
   // cLines 在输入框下方），与视口共用同一套拖选/双击选词/三击选行/复制管线——
-  // 模型信息行等整个底部区域不再是无选择的死区。菜单/选择器/输入框本体仍是 JSX 交互区。
-  const reasoningLines =
-    busy && thinkRef.current && !bufRef.current
-      ? wrapVisible(thinkRef.current.trim(), width - 4).split("\n").slice(-8)
+  // 整个屏幕没有选择死区：菜单/选择器/权限确认行也转成 ANSI 行入同一管线
+  // （单击路由仍按 zones 行号走，交互不变）。输入框本体走独立的字符下标选区。
+  // 注意：行数在整个回合内保持恒定（思考流在转录尾部流动，见 activeFlat）——
+  // chrome 高度变化会让视口边界每帧挪动，与 Ink 差分重绘叠加会互相覆盖。
+  // 菜单/选择器/确认行：按可见宽度截断防 Ink 折行打乱行号映射。
+  const menuA: string[] =
+    menuOpen && !confirm
+      ? [
+          ...menuMatches.map((c, i) =>
+            truncateVisible(i === menuSel ? ansi.white(`❯ ${c.name}   ${c.desc}`) : ansi.dim(`  ${c.name}   ${c.desc}`), width),
+          ),
+          ansi.dim("  ↑↓ select · Tab complete · Enter run"),
+        ]
       : [];
-  const menuLines = menuOpen && !confirm ? menuMatches.length + 1 : 0;
-  const pickerLines = picker ? picker.items.length + 1 : 0;
+  const pickerA: string[] = picker
+    ? [
+        ...picker.items.map((it, i) =>
+          truncateVisible(i === picker.sel ? ansi.white(`❯ ${it.label}`) : ansi.dim(`  ${it.label}`), width),
+        ),
+        ansi.dim(`  ↑↓ 选择 · Enter 确认 · Esc 取消（${picker.kind === "resume" ? "恢复该会话" : "回退到该消息"}）`),
+      ]
+    : [];
+  const confirmA: string[] = confirm
+    ? [
+        truncateVisible(
+          ansi.confirm("▸ Allow ") + ansi.bold(confirm.tool) + ansi.dim(` (${summarizeToolArgs(confirm.tool, confirm.args)}) ? [Y/n]`),
+          width,
+        ),
+      ]
+    : [];
   // 输入框内容行数（多行输入时随之增高；超长行的终端折行不计——点击列映射按逻辑行近似）。
   const inputLines = inputLineCount(input);
   // 子 agent 用量行与状态行只在「有 running」时出现——全部结束后随状态行一起消失。
@@ -889,10 +968,6 @@ export function App({
 
   const aLines: string[] = [];
   if (scrollOffset > 0) aLines.push(ansi.amber(`↺ ${newCount > 0 ? `${newCount} new · ` : ""}Jump to bottom（点击 / 滚到底 / Ctrl+End）`));
-  if (reasoningLines.length) {
-    aLines.push(ansi.dim(`${frame} Reasoning`));
-    aLines.push(...reasoningLines.map((l) => ansi.dim(`  ${l}`)));
-  }
   if (busy) aLines.push(ansi.dim(`${frame} Thinking (${secs}s${estTok > 0 ? ` · ~${estTok} tokens` : ""})`));
   if (working) aLines.push(ansi.amber(`↻ ${working}`) + ansi.dim(` (${wsecs}s)`));
 
@@ -937,13 +1012,21 @@ export function App({
     cLines.push(view.kind === "sub" && view.id === a.id ? `↳ ${a.id}[${a.role}] · t${a.turns} · ${a.elapsedSec}s · 点击查看/插话` : ansi.amber(`↳ ${a.id}[${a.role}] · t${a.turns} · ${a.elapsedSec}s · 点击查看/插话`));
   }
 
+  // chrome 全量行序（与屏幕视觉顺序一致）：a → 菜单 → 选择器 → b → 确认行（输入框边框内）→ c。
+  // 各段 base = 在全量 chrome 行数组中的起始下标——zones 命中换算与渲染高亮共用同一组常量。
+  const menuBase = aLines.length;
+  const pickerBase = menuBase + menuA.length;
+  const bBase = pickerBase + pickerA.length;
+  const confirmBase = bBase + bLines.length;
+  const cBase = confirmBase + confirmA.length;
+
   const chromeHeight =
     aLines.length +
-    menuLines +
-    pickerLines +
+    menuA.length +
+    pickerA.length +
     bLines.length +
     2 + // 输入框上下边框
-    inputLines + // 输入内容行（多行输入随之增高）
+    (confirm ? 1 : inputLines) + // 内容行：确认行恒 1 行；输入随多行变高
     cLines.length;
   // 视口高度 = 终端行数 − chrome − 1 安全行：帧高恰好顶满终端时，写最后一行会引发
   // 屏幕上滚一格 → 整帧错位级联（实测 PTY 里字符逐行炸开）。留 1 行余量根治。
@@ -1010,33 +1093,36 @@ export function App({
       if (scrollOffset > 0) z.jumpRow = row + 1; // aLines 首行是 Jump 按钮
       row += aLines.length;
     }
-    if (menuLines) {
+    if (menuA.length) {
       z.menuTop = row + 1; // 菜单第一项（1-based）
-      row += menuLines;
+      z.textRanges.push({ top: row + 1, lines: menuA.length, base: menuBase }); // 菜单行可拖选
+      row += menuA.length;
     }
-    if (pickerLines) {
+    if (pickerA.length) {
       z.pickerTop = row + 1;
-      row += pickerLines;
+      z.textRanges.push({ top: row + 1, lines: pickerA.length, base: pickerBase }); // 选择器行可拖选
+      row += pickerA.length;
     }
     if (bLines.length) {
-      z.textRanges.push({ top: row + 1, lines: bLines.length, base: aLines.length });
+      z.textRanges.push({ top: row + 1, lines: bLines.length, base: bBase });
       z.subHeaderRow = row + 1; // 子视图头部（点击返回主上下文）
       row += bLines.length;
     }
     row += 1; // 输入框上边框
     z.inputRow = row + 1;
-    row += inputLines + 1; // 输入内容行（多行）+ 下边框
+    if (confirmA.length) z.textRanges.push({ top: row + 1, lines: 1, base: confirmBase }); // 确认行可拖选
+    row += (confirm ? 1 : inputLines) + 1; // 内容行（确认恒 1 行 / 输入可能多行）+ 下边框
     if (cLines.length) {
-      z.textRanges.push({ top: row + 1, lines: cLines.length, base: aLines.length + bLines.length });
+      z.textRanges.push({ top: row + 1, lines: cLines.length, base: cBase });
       // cLines 内部顺序：仪表盘、子用量行（可选）、各 running 子 agent 状态行。
       if (subRunning.length) z.subTop = row + 1 + 1 + subDashLines; // 跳过仪表盘与子用量行
       row += cLines.length;
     }
     return z;
   })();
-  // 屏幕行全量模型（视口行 + chrome 文本行）：选区文本提取/键盘扩展共用。
+  // 屏幕行全量模型（视口行 + 全部 chrome 文本行）：选区文本提取/键盘扩展共用。
   const screenRef = useRef<{ lines: string[] }>({ lines: [] });
-  screenRef.current.lines = [...activeFlat.lines, ...aLines, ...bLines, ...cLines];
+  screenRef.current.lines = [...activeFlat.lines, ...aLines, ...menuA, ...pickerA, ...bLines, ...confirmA, ...cLines];
 
   // ── 鼠标 ────────────────────────────────────────────────────────────────────
   const toggleToolBlock = useCallback((toolCallIdOrBlockId: number) => {
@@ -1083,9 +1169,22 @@ export function App({
         });
         return;
       }
-      if (ev.button !== 0) return; // v1 只处理左键（选择/点击）
       const z = zonesRef.current;
       const inViewport = ev.row >= 1 && ev.row <= z.viewportRows;
+      // 无按键移动（1003h 悬停，button=3）：必须在「只处理左键」过滤前接——悬停摘要行变白；
+      // 目标变化才 setState（逐像素 motion 不逐帧重渲染）。
+      if (ev.kind === "motion" && ev.button === 3) {
+        let id: number | null = null;
+        if (inViewport) {
+          const v = visible({ total, height: viewportHeightRef.current, offset: scrollOffsetRef.current });
+          const owner = flatRef.current.owner[v.start + (ev.row - 1)];
+          const b = owner !== undefined ? blocksRef.current.find((x) => x.id === owner) : undefined;
+          if (b?.kind === "thought" && !b.expanded) id = b.id;
+        }
+        if (hoverIdRef.current !== id) setHoverId(id);
+        return;
+      }
+      if (ev.button !== 0) return; // 只处理左键（选择/点击）；悬停已在上面单独接走
       /** 屏幕（视口）行 → 全局行（可带 offset 覆盖：边缘自动滚后按新视口算） */
       const lineUnder = (row: number, offsetOverride?: number) => {
         const v = visible({ total, height: viewportHeightRef.current, offset: offsetOverride ?? scrollOffsetRef.current });
@@ -1119,7 +1218,7 @@ export function App({
 
       // ── 拖动：跨格才算选择；拖到视口上下边缘自动滚 1 行 ──
       if (ev.kind === "motion") {
-        // 输入区拖选：字符下标变化才算移动；选中段实时反显。
+        // 输入区拖选：字符下标变化才算移动；选中段实时蓝底。
         const idr = inputDragRef.current;
         if (idr) {
           const ch = charAtInput(ev.row, ev.col);
@@ -1230,7 +1329,10 @@ export function App({
               }
             } else {
               const b = blocksRef.current.find((x) => x.id === blockId);
-              if (b?.kind === "tool" && b.body) toggleToolBlock(b.id);
+              if (b?.kind === "thought") {
+                setBlocks((prev) => prev.map((x) => (x.id === b.id ? { ...b, expanded: !b.expanded } : x)));
+                setSel(null); // 展开改变行数，选区失效
+              } else if (b?.kind === "tool" && b.body) toggleToolBlock(b.id);
             }
           }
         }
@@ -1243,7 +1345,7 @@ export function App({
   const blocksRef = useRef(blocks);
   blocksRef.current = blocks;
 
-  // 视口行 + 选区高亮（区间内选择性反显；中间行整行 = [0, ∞)）
+  // 视口行 + 选区高亮（区间内蓝底替换；中间行整行 = [0, ∞)）
   const selRange = sel ? normalizeRange(sel.anchor, sel.active) : null;
   const viewportText = activeFlat.lines
     .slice(vis.start, vis.start + vis.count)
@@ -1270,39 +1372,17 @@ export function App({
       </Box>
 
       {/* chrome 文本段（可选中的信息行）：拖选/双击选词与视口同一套管线。 */}
-      {aLines.length > 0 && <Text>{hlLines(aLines, activeFlat.lines.length + 0)}</Text>}
+      {aLines.length > 0 && <Text>{hlLines(aLines, activeFlat.lines.length)}</Text>}
 
-      {menuOpen && !confirm && (
-        <Box flexDirection="column">
-          {menuMatches.map((c, i) => (
-            <Text key={c.name} color={i === menuSel ? theme.prompt : theme.muted}>
-              {`${i === menuSel ? "❯" : " "} ${c.name}   ${c.desc}`}
-            </Text>
-          ))}
-          <Text color={theme.muted}>{"  ↑↓ select · Tab complete · Enter run"}</Text>
-        </Box>
-      )}
+      {/* 菜单/选择器：ANSI 行（可拖选/复制；单击路由仍按 zones.menuTop/pickerTop）。 */}
+      {menuA.length > 0 && <Text>{hlLines(menuA, activeFlat.lines.length + menuBase)}</Text>}
+      {pickerA.length > 0 && <Text>{hlLines(pickerA, activeFlat.lines.length + pickerBase)}</Text>}
 
-      {picker && (
-        <Box flexDirection="column">
-          {picker.items.map((it, i) => (
-            <Text key={it.key} color={i === picker.sel ? theme.prompt : theme.muted}>
-              {`${i === picker.sel ? "❯" : " "} ${it.label}`}
-            </Text>
-          ))}
-          <Text color={theme.muted}>{`  ↑↓ 选择 · Enter 确认 · Esc 取消（${picker.kind === "resume" ? "恢复该会话" : "回退到该消息"}）`}</Text>
-        </Box>
-      )}
-
-      {bLines.length > 0 && <Text>{hlLines(bLines, activeFlat.lines.length + aLines.length)}</Text>}
+      {bLines.length > 0 && <Text>{hlLines(bLines, activeFlat.lines.length + bBase)}</Text>}
 
       <Box borderStyle="single" borderColor={theme.muted} borderLeft={false} borderRight={false}>
         {confirm ? (
-          <Text>
-            <Text color={theme.confirm}>▸ Allow </Text>
-            <Text bold>{confirm.tool}</Text>
-            <Text color={theme.muted}> ({summarizeToolArgs(confirm.tool, confirm.args)}) ? [Y/n]</Text>
-          </Text>
+          <Text>{hlLines(confirmA, activeFlat.lines.length + confirmBase)}</Text>
         ) : (
           <Box>
             <Text color={theme.prompt}>{"› "}</Text>
@@ -1328,7 +1408,7 @@ export function App({
       </Box>
 
       {/* 仪表盘（含右端复制提示）/ 子用量 / 子 agent 状态行：同为可选中文本。 */}
-      <Text>{hlLines(cLines, activeFlat.lines.length + aLines.length + bLines.length)}</Text>
+      <Text>{hlLines(cLines, activeFlat.lines.length + cBase)}</Text>
     </Box>
   );
 }

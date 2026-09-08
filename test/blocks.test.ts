@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderBlockLines, renderLines, flattenBlocks, defaultCollapsed, resetBlockCache, type Block } from "../src/ui/blocks.js";
+import { renderBlockLines, renderLines, flattenBlocks, defaultCollapsed, resetBlockCache, fmtDur, summarizeThoughtTools, type Block } from "../src/ui/blocks.js";
 import { visibleWidth } from "../src/ui/markdown.js";
 
 test("markdown block：按渲染期宽度折行——同一 block 两种宽度产出不同行（resize 重排的证据）", () => {
@@ -84,4 +84,57 @@ test("折叠切换使缓存失效（collapsed 进缓存键）", () => {
   const e = renderLines({ ...b, collapsed: false }, 80);
   assert.notEqual(c, e);
   assert.ok(c.length < e.length);
+});
+
+test("fmtDur：秒/分秒格式（向下取整）", () => {
+  assert.equal(fmtDur(0), "0s");
+  assert.equal(fmtDur(9.6), "9s");
+  assert.equal(fmtDur(61.4), "1m 1s");
+  assert.equal(fmtDur(120), "2m");
+  assert.equal(fmtDur(101.9), "1m 41s");
+});
+
+test("summarizeThoughtTools：首现顺序聚合、复数、未知工具归并", () => {
+  const t = (name: string) => ({ name, header: name });
+  assert.equal(summarizeThoughtTools([]), "");
+  assert.equal(summarizeThoughtTools([t("read_file")]), "read 1 file");
+  assert.equal(
+    summarizeThoughtTools([t("grep"), t("read_file"), t("read_file"), t("list_dir"), t("grep"), t("bash")]),
+    "searched for 2 patterns, read 2 files, listed 1 directory, ran 1 command",
+  );
+  assert.equal(summarizeThoughtTools([t("hover"), t("definition")]), "used 2 tools");
+});
+
+test("thought 块：折叠一行摘要（灰/悬停白），展开出思考全文与工具明细", () => {
+  const b: Block = {
+    id: 7,
+    kind: "thought",
+    secs: 61,
+    thinking: "先查索引\n再读文件",
+    tools: [
+      { name: "grep", header: "● grep(\"sel\")", preview: "3 files" },
+      { name: "read_file", header: "● read_file(a.ts)", preview: "read 24 lines" },
+    ],
+  };
+  const collapsed = renderBlockLines(b, 100);
+  assert.equal(collapsed.length, 1);
+  assert.ok(collapsed[0]!.includes("✦ Thought for 1m 1s, searched for 1 pattern, read 1 file"), collapsed[0]!);
+  assert.ok(collapsed[0]!.includes("\x1b[38;5;250m"), "默认灰色");
+  const hovered = renderBlockLines(b, 100, true);
+  assert.ok(hovered[0]!.includes("\x1b[38;5;231m"), "悬停变白");
+  const expanded = renderBlockLines({ ...b, expanded: true }, 100);
+  assert.ok(expanded.length >= 5, "摘要 + 思考 2 行 + 工具 2 行");
+  assert.ok(expanded.some((l) => l.includes("先查索引")));
+  assert.ok(expanded.some((l) => l.includes("● read_file(a.ts)") && l.includes("read 24 lines")));
+  // 无时长（/resume 回放）：省略时长段
+  const noDur = renderBlockLines({ ...b, secs: 0 }, 100);
+  assert.ok(noDur[0]!.startsWith("\x1b[38;5;250m✦ Thought, "), noDur[0]!);
+});
+
+test("thought 悬停/展开进缓存键（hover 变体独立缓存）", () => {
+  const b: Block = { id: 9, kind: "thought", secs: 5, thinking: "x", tools: [] };
+  const dim = renderLines(b, 80);
+  const white = renderLines(b, 80, "main", true);
+  assert.notEqual(dim, white, "hover 变体不应命中同一缓存");
+  assert.ok(white[0]!.includes("\x1b[38;5;231m"));
 });

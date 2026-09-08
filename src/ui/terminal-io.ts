@@ -10,7 +10,7 @@ import type { Readable } from "node:stream";
  * · createMouseStdin：**Ink 的 parse-keypress 零鼠标处理**（SGR 序列会漏成乱码输入），
  *   所以给 render() 喂一个过滤代理：鼠标序列剥出成 MouseEvent，其余字节原样透传。
  *   tmux 无 mouse 时滚轮被终端转成 ↑/↓ 方向键——天然走键盘流，这里不用管。
- * · v1 只开 1000+1006（点击 + 滚轮）；拖拽选择要 1002，v2 再开。
+ * · 鼠标上报开 1000（点击）+ 1002（按住拖动，拖选）+ 1003（任意移动，悬停）+ 1006（SGR 坐标）。
  * · 防闪烁不用自己做：Ink 7 内置同步输出（ESC[?2026h/l，TTY 自动启用）。
  */
 
@@ -246,7 +246,7 @@ export class TerminalIo {
     if (this.active) return;
     this.active = true;
     // 顺序：先切备用屏（保存光标），再开鼠标/藏光标
-    const mouse = opts.mouse !== false ? `${ESC}[?1000h${ESC}[?1002h${ESC}[?1006h` : ""; // 1002=按住拖动上报（拖选）
+    const mouse = opts.mouse !== false ? `${ESC}[?1000h${ESC}[?1002h${ESC}[?1003h${ESC}[?1006h` : ""; // 1002=按住拖动（拖选）；1003=任意移动（悬停）
     this.out.write(`${ESC}[?1049h${mouse}${ESC}[?25l`);
     const onSignal = () => {
       this.restore();
@@ -269,6 +269,6 @@ export class TerminalIo {
       process.removeListener(name, h);
     }
     this.handlers.length = 0;
-    this.out.write(`${ESC}[?1006l${ESC}[?1002l${ESC}[?1000l${ESC}[?25h${ESC}[?1049l`);
+    this.out.write(`${ESC}[?1006l${ESC}[?1003l${ESC}[?1002l${ESC}[?1000l${ESC}[?25h${ESC}[?1049l`);
   }
 }

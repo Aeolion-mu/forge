@@ -27,6 +27,14 @@ test("parseMouseSequence：修饰键位（Shift=4 / Alt=8 / Ctrl=16）；松开=
   assert.equal(rel.kind, "release");
 });
 
+test("parseMouseSequence：无按键移动（1003h 悬停，b=35 → motion/button 3）", () => {
+  const h = parseMouseSequence(`${ESC}[<35;10;20M`)!; // 32(移动)|3(无按键)
+  assert.equal(h.kind, "motion");
+  assert.equal(h.button, 3);
+  assert.equal(h.col, 10);
+  assert.equal(h.row, 20);
+});
+
 test("parseMouseSequence：非鼠标序列返回 null", () => {
   assert.equal(parseMouseSequence(`${ESC}[A`), null); // 方向键
   assert.equal(parseMouseSequence(`${ESC}[200~`), null); // 括号粘贴

@@ -29,8 +29,17 @@ export type Block =
   | { id: number; kind: "banner"; lines: string[] }
   | { id: number; kind: "user"; text: string }
   | { id: number; kind: "markdown"; source: string; prefix?: string }
-  | { id: number; kind: "thinking"; tokens: number }
-  | { id: number; kind: "turn"; secs: string; out: number }
+  | {
+      id: number;
+      kind: "thought";
+      /** 整回合时长（秒）；0 = 未知（/resume 回放无瞬态数据，省略时长段）。 */
+      secs: number;
+      /** 回合内的思考全文（多段以空行相接）。 */
+      thinking: string;
+      /** 回合内的工具调用记录（读类已折叠进来；写类块另存但计入统计）。 */
+      tools: ThoughtTool[];
+      expanded?: boolean;
+    }
   | {
       id: number;
       kind: "tool";
@@ -43,6 +52,17 @@ export type Block =
   | { id: number; kind: "plain"; text: string }
   | { id: number; kind: "error"; text: string; hint?: string };
 
+/** thought 块内记录的一次工具调用（展开明细用）。 */
+export interface ThoughtTool {
+  name: string;
+  /** 与 tool 块同款头部行（含 ANSI）。 */
+  header: string;
+  /** 结果首行/摘要（纯文本）。 */
+  preview?: string;
+  /** 配对 tool_end 回填 preview 用（live 累积器；入块后保留无害）。 */
+  toolCallId?: string;
+}
+
 /** pushBlock 的入参类型：Block 去掉 id（分布式 Omit——直接 Omit 联合会塌成公共键）。 */
 export type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
 export type NewBlock = DistributiveOmit<Block, "id">;
@@ -52,11 +72,46 @@ export function defaultCollapsed(body: ToolBody): boolean {
   return body.kind === "text" && Boolean(body.full) && body.full !== body.preview;
 }
 
+/** 回合时长摘要：`9s` / `1m 1s` / `2m 5s`（向下取整）。 */
+export function fmtDur(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r ? `${m}m ${r}s` : `${m}m`;
+}
+
+/** 工具名 → 统计短语（Claude Code 式；未列出的归 "used N tools"）。按首现顺序聚合。 */
+const TOOL_PHRASE: Record<string, (n: number) => string> = {
+  read_file: (n) => `read ${n} file${n > 1 ? "s" : ""}`,
+  grep: (n) => `searched for ${n} pattern${n > 1 ? "s" : ""}`,
+  list_dir: (n) => `listed ${n} director${n > 1 ? "ies" : "y"}`,
+  glob: (n) => `found ${n} path${n > 1 ? "s" : ""}`,
+  bash: (n) => `ran ${n} command${n > 1 ? "s" : ""}`,
+  ssh_run: (n) => `ran ${n} remote command${n > 1 ? "s" : ""}`,
+  write_file: (n) => `edited ${n} file${n > 1 ? "s" : ""}`,
+  edit_file: (n) => `edited ${n} file${n > 1 ? "s" : ""}`,
+  apply_patch: (n) => `edited ${n} file${n > 1 ? "s" : ""}`,
+};
+
+/** 回合工具统计摘要：`searched for 2 patterns, read 3 files`（首现顺序，未知工具归并）。 */
+export function summarizeThoughtTools(tools: ThoughtTool[]): string {
+  const counts = new Map<string, number>();
+  let others = 0;
+  for (const t of tools) {
+    if (TOOL_PHRASE[t.name]) counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
+    else others++;
+  }
+  const parts = [...counts.entries()].map(([name, n]) => TOOL_PHRASE[name]!(n));
+  if (others) parts.push(`used ${others} tool${others > 1 ? "s" : ""}`);
+  return parts.join(", ");
+}
+
 /**
  * block → 渲染行（ANSI 字符串数组）。纯函数；按 (id,width) 记忆化见 renderLines。
- * width = 终端列数（渲染期值）。
+ * width = 终端列数（渲染期值）；hover = 鼠标正悬停在本 block（thought 折叠行变白）。
  */
-export function renderBlockLines(b: Block, width: number): string[] {
+export function renderBlockLines(b: Block, width: number, hover = false): string[] {
   const content = Math.max(10, width - 3); // 与旧 GUTTER=3 对齐：2 悬挂缩进 + 1 安全列
   switch (b.kind) {
     case "banner":
@@ -72,10 +127,22 @@ export function renderBlockLines(b: Block, width: number): string[] {
       const md = renderMarkdown(b.source, width).split("\n").map((l, i) => (i === 0 ? `${prefix} ${l}` : `  ${l}`));
       return md;
     }
-    case "thinking":
-      return [ansi.dim(`${SPARK_REST} Thinking · ~${b.tokens} tokens (collapsed)`)];
-    case "turn":
-      return [ansi.dim(`  ${b.secs}s · ${b.out} tokens`)];
+    case "thought": {
+      // 折叠摘要行（Claude Code 式）：灰 → 悬停白 → 点击展开
+      const stats = summarizeThoughtTools(b.tools);
+      const dur = b.secs > 0 ? ` for ${fmtDur(b.secs)}` : "";
+      const head = (hover ? ansi.white : ansi.dim)(`${SPARK_REST} Thought${dur}${stats ? `, ${stats}` : ""}`);
+      if (!b.expanded) return [head];
+      const out = [head];
+      if (b.thinking) {
+        out.push(...wrapVisible(b.thinking, content - 4).split("\n").map((l) => ansi.dim(`  ⎿ ${l}`)));
+      }
+      for (const t of b.tools) {
+        const pv = t.preview ? ansi.dim(` ⎚ ${t.preview.slice(0, Math.max(20, content - 10))}`) : "";
+        out.push(`  ${ansi.dim("⎿")} ${t.header}${pv}`);
+      }
+      return out;
+    }
     case "tool": {
       const head = [b.header];
       if (!b.body) return head;
@@ -114,23 +181,24 @@ export function resetBlockCache(): void {
   cache.clear();
 }
 
-export function renderLines(b: Block, width: number, ns = "main"): string[] {
-  const key = `${generation}:${ns}:${b.id}:${width}:${b.kind === "tool" ? (b.collapsed ? "c" : "e") : ""}`;
+export function renderLines(b: Block, width: number, ns = "main", hover = false): string[] {
+  const key = `${generation}:${ns}:${b.id}:${width}:${b.kind === "tool" ? (b.collapsed ? "c" : "e") : b.kind === "thought" ? (b.expanded ? "e" : "c") : ""}${hover ? ":h" : ""}`;
   let lines = cache.get(key);
   if (!lines) {
-    lines = renderBlockLines(b, width);
+    lines = renderBlockLines(b, width, hover);
     cache.set(key, lines);
   }
   return lines;
 }
 
 /** 展开全部 block → 行数组 + 每行的 blockId 映射（鼠标命中测试用）。
- *  ns = 命名空间（主转录 "main" / 各子 agent "sub:<id>"）：各上下文 block id 独立计数，靠 ns 隔离缓存键。 */
-export function flattenBlocks(blocks: Block[], width: number, ns = "main"): { lines: string[]; owner: number[] } {
+ *  ns = 命名空间（主转录 "main" / 各子 agent "sub:<id>"）：各上下文 block id 独立计数，靠 ns 隔离缓存键。
+ *  hoverId = 鼠标悬停中的 block id（thought 折叠行变白）。 */
+export function flattenBlocks(blocks: Block[], width: number, ns = "main", hoverId?: number): { lines: string[]; owner: number[] } {
   const lines: string[] = [];
   const owner: number[] = [];
   for (const b of blocks) {
-    for (const l of renderLines(b, width, ns)) {
+    for (const l of renderLines(b, width, ns, hoverId === b.id)) {
       lines.push(l);
       owner.push(b.id);
     }

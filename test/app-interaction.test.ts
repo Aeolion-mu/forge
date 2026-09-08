@@ -6,7 +6,9 @@ import { render } from "ink";
 import type { HarnessEvent } from "@earendil-works/pi-agent-core";
 import { App, type AppBridge } from "../src/ui/app.js";
 import { createMouseStdin } from "../src/ui/terminal-io.js";
+import { matchCommands } from "../src/ui/commands.js";
 import { resetBlockCache } from "../src/ui/blocks.js";
+import { SEL_ON } from "../src/ui/theme.js";
 import { SubAgentRegistry } from "../src/kernel/subagent-registry.js";
 import type { ForgeAgent } from "../src/kernel/forge-agent.js";
 import type { ForgeConfig } from "../src/config.js";
@@ -65,6 +67,8 @@ function wiredRegistry(bridgeRef: { current: AppBridge | null }) {
 interface Harness {
   write: (s: string) => void;
   frame: () => string;
+  /** 最近一帧的原始输出（含 ANSI）——选区高亮等观感断言用。 */
+  raw: () => string;
   flush: () => Promise<void>;
   unmount: () => void;
   bridge: AppBridge;
@@ -137,6 +141,7 @@ function mountApp(opts: { resumedFrom?: unknown; entries?: unknown[] } = {}): Ha
   return {
     write: (s) => realStdin.write(s),
     frame,
+    raw: () => [...chunks].reverse().find((c) => stripAnsi(c).trim().length > 20) ?? "",
     flush: async () => {
       await new Promise((r) => setTimeout(r, 120));
     },
@@ -234,6 +239,43 @@ test("App 交互：子 agent 状态行出现/消失 · 点击切换上下文 · 
     assert.ok(!f6.includes("点击查看"), `结束后状态行应消失：\n${f6}`);
     assert.ok(!f6.includes("mock/flash"), `结束后子用量行应消失：\n${f6}`);
   } finally {
+    h.unmount();
+  }
+});
+
+test("App 交互：菜单行可拖选出蓝底选区（Claude Code 式全覆盖）·单击仍选菜单项", async () => {
+  resetBlockCache();
+  const prevCopy = process.env.FORGE_COPY_ON_SELECT;
+  process.env.FORGE_COPY_ON_SELECT = "0"; // 拖选不真写剪贴板（测试机别动 pbcopy）
+  const h = mountApp();
+  try {
+    await h.flush();
+    h.write("/");
+    await h.flush();
+    const f = h.frame();
+    assert.ok(f.includes("/converge"), `输入 / 应展开命令菜单：\n${f}`);
+
+    // 布局：rows=30、无 a/b/picker/confirm/子行 → chrome = 菜单(n+1) + 边框2 + 输入1 + 仪表盘1
+    // → viewport = 30-(n+5)-1，菜单首行 = viewport+1 = 25-n。
+    const n = matchCommands("/").length;
+    const menuTop = 25 - n;
+
+    // 拖选菜单首行前 12 列 → 松开定格选区（自动复制已被 env 关掉）
+    h.write(mouse.press(1, menuTop) + mouse.motion(12, menuTop) + mouse.release(12, menuTop));
+    await h.flush();
+    const raw = h.raw();
+    assert.ok(raw.includes(SEL_ON), `菜单行拖选后应出现蓝底选区（SEL_ON）：\n${JSON.stringify(raw.slice(-500))}`);
+    assert.ok(h.frame().includes("/converge"), "选区不应破坏菜单渲染");
+
+    // 普通单击（同格 press+release）第二项 → 仍走菜单选择路由（❯ 移到 /compact 行）
+    h.write(mouse.press(3, menuTop + 1) + mouse.release(3, menuTop + 1));
+    await h.flush();
+    const f2 = h.frame();
+    const item2 = f2.split("\n").find((l) => l.includes("/compact"));
+    assert.ok(item2?.includes("❯"), `单击第二项应选中它：\n${f2}`);
+  } finally {
+    if (prevCopy === undefined) delete process.env.FORGE_COPY_ON_SELECT;
+    else process.env.FORGE_COPY_ON_SELECT = prevCopy;
     h.unmount();
   }
 });

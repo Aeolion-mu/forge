@@ -19,29 +19,51 @@ test("replay：用户/助手文本逐字保留（含中文、多行、markdown �
   assert.equal((blocks[1] as { source: string }).source, src); // 逐字节
 });
 
-test("replay：thinking → thinking 块；user 的 content 数组形态文本拼接", () => {
+test("replay：thinking → thought 摘要块（插在最终回复前）；user 的 content 数组形态文本拼接", () => {
   const blocks = replayBlocks([
     msg("assistant", { content: [{ type: "thinking", thinking: "嗯…".repeat(40) }, { type: "text", text: "答" }] }),
     msg("user", { content: [{ type: "text", text: "A" }, { type: "image", url: "x" }, { type: "text", text: "B" }] }),
   ]);
-  assert.equal(blocks[0]!.kind, "thinking");
-  assert.equal(blocks[1]!.kind, "markdown");
+  assert.equal(blocks[0]!.kind, "thought"); // thinking 全文进摘要块（可展开）
+  assert.equal((blocks[0] as { thinking: string }).thinking, "嗯…".repeat(40));
+  assert.equal((blocks[0] as { secs: number }).secs, 0); // 时长属瞬态，回放省略
+  assert.equal(blocks[1]!.kind, "markdown"); // 摘要行在最终回复之前
   assert.equal(blocks[2]!.kind, "user");
   assert.equal((blocks[2] as { text: string }).text, "AB"); // 图片跳过、文本拼接
 });
 
-test("replay：toolCall + toolResult 按 toolCallId 配对回填（默认折叠含全文）", () => {
-  const callId = "call-1";
+test("replay：读类工具折叠进 thought（preview 回填）；写类 toolCall/toolResult 配对回填", () => {
+  const readId = "call-read";
+  const writeId = "call-write";
+  const result = (callId: string, text: string) =>
+    ({ id: `e${idc++}`, parentId: null, seq: idc, timestamp: 0, type: "message", message: { role: "toolResult", toolCallId: callId, toolName: "bash", content: [{ type: "text", text }], isError: false, timestamp: 0 } }) as unknown as Entry;
   const blocks = replayBlocks([
-    msg("assistant", { content: [{ type: "toolCall", id: callId, name: "bash", arguments: { cmd: "seq 1 60" } }] }),
-    { id: `e${idc++}`, parentId: null, seq: idc, timestamp: 0, type: "message", message: { role: "toolResult", toolCallId: callId, toolName: "bash", content: [{ type: "text", text: "1\n2\n3\n…\n60" }], isError: false, timestamp: 0 } } as unknown as Entry,
+    msg("user", { content: "查一下" }),
+    msg("assistant", { content: [
+      { type: "thinking", thinking: "先读再写" },
+      { type: "toolCall", id: readId, name: "bash", arguments: { cmd: "seq 1 60" } },
+      { type: "toolCall", id: writeId, name: "edit_file", arguments: { path: "a.ts" } },
+    ] }),
+    result(readId, "1\n2\n3\n…\n60"),
+    result(writeId, "done\n(1 file changed)"),
+    msg("assistant", { content: [{ type: "text", text: "完成" }] }),
   ]);
-  const tool = blocks[0]!;
-  assert.equal(tool.kind, "tool");
-  const t = tool as { body?: { kind: string; preview: string; full: string; isError: boolean }; collapsed?: boolean };
-  assert.equal(t.body?.full, "1\n2\n3\n…\n60");
-  assert.equal(t.body?.preview, "1");
-  assert.equal(t.collapsed, true); // 有全文默认折叠
+  // 写类 tool 块保留 + 配对回填（默认折叠含全文）
+  const tool = blocks.find((b) => b.kind === "tool") as { body?: { full: string; preview: string }; collapsed?: boolean };
+  assert.ok(tool, "写类工具应保留 tool 块");
+  assert.equal(tool.body?.full, "done\n(1 file changed)");
+  assert.equal(tool.body?.preview, "done");
+  assert.equal(tool.collapsed, true);
+  // 读类 bash 折叠进 thought（preview = 结果首行）；摘要块插在最终回复前
+  const thought = blocks.find((b) => b.kind === "thought") as { thinking: string; tools: Array<{ name: string; preview?: string }> };
+  assert.ok(thought, "应有 thought 摘要块");
+  assert.equal(thought.thinking, "先读再写");
+  assert.equal(thought.tools.length, 1);
+  assert.equal(thought.tools[0]!.name, "bash");
+  assert.equal(thought.tools[0]!.preview, "1");
+  const last = blocks[blocks.length - 1]!;
+  assert.equal(last.kind, "markdown"); // 「完成」在最后
+  assert.equal(blocks[blocks.length - 2]!.kind, "thought"); // 摘要行插在最终回复之前
 });
 
 test("replay：孤儿 toolResult 单独落 plain 不丢数据；错误结果 isError 传递", () => {
