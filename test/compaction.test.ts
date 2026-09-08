@@ -94,6 +94,19 @@ test("buildSummaryPrompt：有 previousSummary 走增量模板", () => {
   assert.match(p, /Update the existing summary/);
 });
 
+test("buildSummaryPrompt：skillsUsed 追加第 10 段（P4，防压缩后忘记已用 skill）", () => {
+  const p = buildSummaryPrompt("CONV", undefined, ["triton-kernel-basics", "hygon-dtk-vs-rocm"]);
+  assert.match(p, /10\. Skills Used/);
+  assert.match(p, /triton-kernel-basics, hygon-dtk-vs-rocm/);
+  assert.match(p, /re-load with skill_read/);
+  // 增量模板同样带
+  const upd = buildSummaryPrompt("NEW", "OLD", ["triton-kernel-basics"]);
+  assert.match(upd, /10\. Skills Used/);
+  // 无已用 skill → 不出现第 10 段
+  assert.doesNotMatch(buildSummaryPrompt("CONV", undefined, []), /Skills Used/);
+  assert.doesNotMatch(buildSummaryPrompt("CONV", undefined), /Skills Used/);
+});
+
 test("isTooLongError 识别多种过长措辞", () => {
   assert.equal(isTooLongError("This model's maximum context length is 128000 tokens"), true);
   assert.equal(isTooLongError("prompt is too long"), true);

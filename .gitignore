@@ -8,3 +8,6 @@ forge.config.json
 *.pem
 .scratch/
 .DS_Store
+# vendors 快照不进 git（按需 npm run skills:fetch）；lock 与目录结构进 git
+skills/vendors/*
+!skills/vendors/skills.lock.json

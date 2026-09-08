@@ -11,7 +11,7 @@ export interface SlashCommand {
 export const COMMANDS: SlashCommand[] = [
   { name: "/converge", desc: "Work until a goal holds (Convergent verifies)" },
   { name: "/compact", desc: "Compact context (9-section summary)" },
-  { name: "/skills", desc: "List loaded skills" },
+  { name: "/skills", desc: "List skills · /skills <name> injects its body" },
   { name: "/stats", desc: "Show session metrics" },
   { name: "/pass-permissions", desc: "Bypass write/exec confirms (ON by default; --confirm to re-enable)" },
   { name: "/mouse", desc: "Mouse capture on/off (off = native text selection; PgUp/PgDn still scroll)" },

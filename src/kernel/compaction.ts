@@ -154,11 +154,17 @@ Rules: preserve security-relevant instructions/constraints VERBATIM; keep exact 
 /** 9 段模板（滚动增量：在 previousSummary 上增补）。 */
 const UPDATE_PROMPT = `Update the existing summary in <previous-summary> with the NEW messages. RULES: preserve all prior info; move items from In Progress/Pending to Done when completed; refresh Current Work and Next Step; preserve exact paths/errors/commands; keep the same 9 sections (Primary Request and Intent / Key Technical Concepts / Files and Code Sections / Errors and Fixes / Problem Solving / All User Messages / Pending Tasks / Current Work / Next Step); write in the SAME LANGUAGE as the conversation.`;
 
-/** 构造摘要请求的 user prompt。 */
-export function buildSummaryPrompt(conversationText: string, previousSummary?: string): string {
+/** 构造摘要请求的 user prompt。skillsUsed：本会话 skill_read 过的 skill 名（追加第 10 段，防压缩后失忆）。 */
+export function buildSummaryPrompt(conversationText: string, previousSummary?: string, skillsUsed?: string[]): string {
   let p = `<conversation>\n${conversationText}\n</conversation>\n\n`;
   if (previousSummary) p += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-  return p + (previousSummary ? UPDATE_PROMPT : FRESH_PROMPT);
+  let prompt = previousSummary ? UPDATE_PROMPT : FRESH_PROMPT;
+  if (skillsUsed?.length) {
+    prompt +=
+      `\n\nAdditionally append section 10. Skills Used — the conversation loaded these skills via skill_read: ${skillsUsed.join(", ")}. ` +
+      `List each as "name — re-load with skill_read(name) if still relevant". Preserve this section verbatim across updates.`;
+  }
+  return p + prompt;
 }
 
 /** 注入的「调一次模型做摘要」回调（④ 用 completeSimple 实现，单测用 fake）。 */
@@ -194,13 +200,15 @@ export async function runFullCompaction(opts: {
   maxDepth?: number;
   /** 进度状态回调（驱动 TUI 动态显示「正在干什么」）。 */
   onStatus?: (msg: string) => void;
+  /** 本会话 skill_read 过的 skill 名 → 摘要第 10 段 Skills used（压缩后指引重新加载）。 */
+  skillsUsed?: string[];
 }): Promise<string> {
   const { messages, summarize, previousSummary, onStatus } = opts;
   const maxDepth = opts.maxDepth ?? 3;
   if (messages.length === 0) throw new CompactionFailed("没有可压缩的消息");
 
   const once = async (msgs: CompactMessage[], prev?: string): Promise<SummarizeResult> => {
-    const userPrompt = buildSummaryPrompt(serializeConversation(msgs), prev);
+    const userPrompt = buildSummaryPrompt(serializeConversation(msgs), prev, opts.skillsUsed);
     return summarize({ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, userPrompt });
   };
 

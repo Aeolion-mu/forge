@@ -1,0 +1,37 @@
+{
+  "$schema": "skills-vendor-lock-v1",
+  "comment": "上游 skills 快照的更新锚点。npm run skills:fetch 按 repo+ref 拉取；subpath 只拷贝源仓内该子树（结果落在 vendors/<name>/）。只登记 MIT/Apache-2.0 仓库；CANN OSL 等非标协议内容禁止 vendor（走 delta 自建改写）。ref 用分支/标签名。",
+  "vendors": {
+    "amd-skills": {
+      "repo": "https://github.com/amd/skills",
+      "ref": "main",
+      "license": "MIT"
+    },
+    "geak": {
+      "repo": "https://github.com/AMD-AGI/GEAK",
+      "ref": "main",
+      "license": "MIT",
+      "subpath": "expert_skills"
+    },
+    "tensormux-kernel-skills": {
+      "repo": "https://github.com/tensormux/kernel-skills",
+      "ref": "main",
+      "license": "MIT"
+    },
+    "kernelflow-cuda-optimizer": {
+      "repo": "https://github.com/KernelFlow-ops/cuda-optimized-skill",
+      "ref": "main",
+      "license": "MIT"
+    },
+    "flagos-skills": {
+      "repo": "https://github.com/flagos-ai/skills",
+      "ref": "main",
+      "license": "Apache-2.0"
+    },
+    "metax-tileops": {
+      "repo": "https://gitee.com/MetaX-MACA/TileOPs-Metax",
+      "ref": "master",
+      "license": "MIT"
+    }
+  }
+}

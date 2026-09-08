@@ -42,6 +42,7 @@ function testConfig(workdir: string): ForgeConfig {
     models: [],
     workdir,
     skillsDirs: [],
+    skills: { builtin: false, targets: ["common"], dirs: [], compat: false, indexBudgetTokens: 1500, overrides: {} },
     sessionsDir: join(workdir, ".forge-sessions"),
     auditPath: join(workdir, ".forge-audit.jsonl"),
     compaction: { reserveTokens: 16384, keepRecentTokens: 20000 },

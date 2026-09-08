@@ -1,0 +1,6 @@
+# 海光：AMD 家底（HIP 同源）+ 海光差异层覆盖同名。
+name: hygon
+label: 海光 DCU（DTK 6.x）
+include:
+  - target:amd
+  - delta:hygon

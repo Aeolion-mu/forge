@@ -1,0 +1,6 @@
+# FlagOS 通用线：智源多芯片算子生成（天数/沐曦/海光/燧原目标）。可与具体厂商 target 并存。
+name: flagos
+label: FlagOS 多芯片（kernelgen）
+include:
+  - common
+  - vendor:flagos-skills

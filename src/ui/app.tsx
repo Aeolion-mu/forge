@@ -10,6 +10,7 @@ import { createRunQueue } from "./run-queue.js";
 import { ctrlCAction } from "./keybinds.js";
 import { getSandboxStatus } from "../sandbox/exec.js";
 import { explainApiError } from "../kernel/errors.js";
+import { readSkillContent } from "../kernel/skills.js";
 import { defaultCollapsed, flattenBlocks, resetBlockCache, type Block, type NewBlock, type ToolBody, type ThoughtTool } from "./blocks.js";
 import { visible, scrollBy } from "./viewport.js";
 import type { MouseEvent, MouseStdin } from "./terminal-io.js";
@@ -758,8 +759,22 @@ export function App({
         push(ansi.dim("Permission bypass 已默认开启（--confirm 可回到逐次确认）。灾难命令仍被硬拦。"));
       },
       "/skills": () => {
-        const sk = agent.listSkills();
-        push(sk.length ? sk.map((s) => `  · \x1b[1m${s.name}\x1b[0m ${s.description}`).join("\n") : ansi.dim("(no skills loaded)"));
+        const rs = agent.skillsRegistry.records;
+        if (!rs.length) return push(ansi.dim("(no skills loaded)"));
+        push(
+          rs
+            .map((r) => {
+              const tags = [r.source, r.origin ?? r.layer, ...(r.targets.length ? [r.targets.join(",")] : []), ...(r.nameOnly ? ["name-only"] : []), ...(r.invocation.model ? [] : ["user-only"])];
+              return `  · ${ansi.bold(r.name)} ${r.description}${ansi.dim(` 〔${tags.join(" · ")}〕`)}`;
+            })
+            .join("\n") +
+            ansi.dim(
+              `\n  共 ${rs.length} 个 · 索引快照 ≈${Math.round(agent.skillsRegistry.indexBlock.length / 4)} tok · 会话内锁定（文件变更下个会话生效） · /skills <name> 显式注入`,
+            ) +
+            (agent.skillsRegistry.diagnostics.length
+              ? ansi.error(`\n  ⚠ ${agent.skillsRegistry.diagnostics.length} 条诊断（覆盖/缺 vendor 等）`)
+              : ""),
+        );
       },
       "/resume": async () => {
         if (busy || working !== null) return push(ansi.dim("运行中不可 /resume（先 Ctrl+C 中止）"));
@@ -850,6 +865,24 @@ export function App({
           push(xs.length ? xs.map((x) => `  ${x.id} [${x.role}] ${x.status} · ${x.turns} 轮 / ${x.tools} 工具 · ${x.elapsedSec}s`).join("\n") + ansi.dim("\n  /agents <id> 查看其上下文（Esc 返回；子视图内输入 = 插话）") : ansi.dim("暂无子 agent——主 agent spawn_subagent 后会出现在底部状态行（可点击查看）。"));
         } else if (agent.listSubAgents().some((x) => x.id === arg)) openSubView(arg);
         else push(ansi.error(`无此子 agent：${arg}（/agents 查看清单）`));
+        return;
+      }
+      // /skills 带参命令（/skills · /skills <name>：正文作为用户消息注入——append-only 天然合规）
+      if (line === "/skills" || line.startsWith("/skills ")) {
+        const arg = line.slice("/skills".length).trim();
+        if (!arg) {
+          await slashHandlers["/skills"]!();
+        } else {
+          const rec = agent.skillsRegistry.get(arg);
+          if (!rec) push(ansi.error(`无此 skill：${arg}${agent.skillsRegistry.suggest(arg).length ? `（相近：${agent.skillsRegistry.suggest(arg).join(", ")}）` : ""}（/skills 查看清单）`));
+          else if (rec.invocation.user === false) push(ansi.error(`skill「${arg}」不可由用户调用（user-invocable: false）`));
+          else {
+            const { body } = readSkillContent(rec);
+            push(ansi.amber(`[skill: ${arg}] 已注入（${rec.origin ?? rec.source}${rec.filePath}）`));
+            if (queueRef.current.submit(`[skill: ${arg}]\n\n${body.trim()}`) === "steered") push(ansi.dim("↳ 已插入当前任务 — 本步完成后送达"));
+          }
+        }
+        if (viewRef.current.kind === "sub") setToast("命令输出在主上下文");
         return;
       }
       const handler = slashHandlers[line];

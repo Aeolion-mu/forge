@@ -1,0 +1,4 @@
+# 默认 target：只挂通用层（不激活任何厂商视图）。
+# 厂商 target（amd/hygon/...）在 P3 落内容后加入本目录；激活方式：forge.config.json → skills.targets。
+include:
+  - common
