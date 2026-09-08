@@ -373,13 +373,14 @@ test("App 交互：模型信息行可拖选/双击选中复制，复制提示与
     assert.ok(dashLineOf(h.frame()), "仪表盘行应存在");
     assert.ok(!dashLineOf(h.frame()).includes("已复制"), "初始无复制提示");
 
-    // 拖选仪表盘行的模型名一段 → 松开即复制 → toast 出现在同一行右端
+    // 拖选仪表盘行的模型名一段 → 松开即复制 → toast 出现在同一行右端（完整、不折行）
     h.write(mouse.press(3, ROWS - 1) + mouse.motion(8, ROWS - 1) + mouse.release(8, ROWS - 1));
     await h.flush();
     const f1 = h.frame();
     const d1 = dashLineOf(f1);
     assert.ok(d1.includes("▌ main"), `仪表盘行仍在：\n${f1}`);
-    assert.ok(d1.includes("已复制"), `复制提示应与模型信息同一行：\n${f1}`);
+    assert.ok(d1.endsWith("字符"), `复制提示须完整落在仪表盘行内（右端以「字符」收尾，不折行）：\n${f1}`);
+    assert.ok(f1.split("\n").filter((l) => l.includes("已复制")).length === 1, "复制提示只应出现在一行");
 
     // 双击模型名 → 选词复制（同格两次 <500ms）
     h.write(mouse.press(4, ROWS - 1) + mouse.release(4, ROWS - 1));
