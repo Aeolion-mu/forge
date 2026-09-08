@@ -12,7 +12,7 @@ test("仓库真实 skills.lock.json 可解析（协议白名单内、URL/ref 合
   assert.deepEqual(Object.keys(lock).sort(), [
     "amd-skills", "flagos-skills", "geak", "kernelflow-cuda-optimizer", "metax-tileops", "tensormux-kernel-skills",
   ]);
-  assert.equal(lock.geak!.subpath, "expert_skills");
+  assert.equal(lock.geak!.subpath, "perf_knowledge/expert_skills");
 });
 
 test("parseLock：坏 JSON / 缺 vendors / 未知字段 / 协议白名单 / subpath 穿越 → 报错", () => {

@@ -1,6 +1,6 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -404,13 +404,28 @@ test("validateConfigFile：skills 段未知字段/类型错误/枚举错误报�
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-test("仓库 targets/：10 个 manifest 全部可解析、无诊断", () => {
+/** 仓库 skills/ 的临时拷贝（剔除 vendors 内容）：断言不受本机是否跑过 skills:fetch 影响。 */
+function repoSkillsWithoutVendors(): string {
+  const dest = join(root, "repo-skills");
+  cpSync(join(REPO_ROOT, "skills"), dest, { recursive: true });
+  rmSync(join(dest, "vendors"), { recursive: true, force: true });
+  mkdirSync(join(dest, "vendors"), { recursive: true });
+  return dest;
+}
+
+test("仓库 targets/：10 个 manifest 全部可解析、无诊断；availableTargets 暴露全部（含未激活）", () => {
   const { manifests, diagnostics } = loadTargetManifests(join(REPO_ROOT, "skills", "targets"));
   assert.equal(diagnostics.length, 0);
   assert.deepEqual(
     [...manifests.keys()].sort(),
     ["amd", "ascend", "common", "enflame", "flagos", "hygon", "iluvatar", "metax", "nvidia", "triton"],
   );
+  const reg = SkillsRegistry.create({
+    builtinRoot: repoSkillsWithoutVendors(), builtin: true, activated: ["common"],
+    globalDir: join(root, "no-global"), projectDir: join(root, "no-proj"),
+  });
+  assert.deepEqual(reg.availableTargets, ["amd", "ascend", "common", "enflame", "flagos", "hygon", "iluvatar", "metax", "nvidia", "triton"]);
+  assert.ok(reg.get("triton-kernel-basics")!.targets.includes("common"));
 });
 
 test("仓库 common 层：3 个通用 skill 可解析", () => {
@@ -421,8 +436,9 @@ test("仓库 common 层：3 个通用 skill 可解析", () => {
 });
 
 test("仓库 hygon target：AMD 家底传递 + delta 记录 + 未 fetch 的 vendor 降级 warning", () => {
-  const { manifests } = loadTargetManifests(join(REPO_ROOT, "skills", "targets"));
-  const res = resolveTargets({ builtinRoot: join(REPO_ROOT, "skills"), manifests, activated: ["hygon"] });
+  const skillsRoot = repoSkillsWithoutVendors();
+  const { manifests } = loadTargetManifests(join(skillsRoot, "targets"));
+  const res = resolveTargets({ builtinRoot: skillsRoot, manifests, activated: ["hygon"] });
   const names = res.records.map((r) => r.name);
   // common + amd delta + hygon delta 都在
   for (const n of ["triton-kernel-basics", "amd-rocm-notes", "hygon-dtk-vs-rocm"]) assert.ok(names.includes(n), `缺 ${n}`);
@@ -436,18 +452,20 @@ test("仓库 hygon target：AMD 家底传递 + delta 记录 + 未 fetch 的 vend
 });
 
 test("仓库 metax/nvidia target：vendor_missing 降级 + delta 记录在", () => {
-  const { manifests } = loadTargetManifests(join(REPO_ROOT, "skills", "targets"));
-  const metax = resolveTargets({ builtinRoot: join(REPO_ROOT, "skills"), manifests, activated: ["metax"] });
+  const skillsRoot = repoSkillsWithoutVendors();
+  const { manifests } = loadTargetManifests(join(skillsRoot, "targets"));
+  const metax = resolveTargets({ builtinRoot: skillsRoot, manifests, activated: ["metax"] });
   assert.ok(metax.records.some((r) => r.name === "metax-maca-notes"));
   assert.ok(metax.diagnostics.some((d) => d.code === "vendor_missing" && d.message.includes("metax-tileops")));
-  const nvidia = resolveTargets({ builtinRoot: join(REPO_ROOT, "skills"), manifests, activated: ["nvidia"] });
+  const nvidia = resolveTargets({ builtinRoot: skillsRoot, manifests, activated: ["nvidia"] });
   assert.ok(nvidia.records.some((r) => r.name === "nvidia-deepcuts"));
   assert.ok(nvidia.diagnostics.filter((d) => d.code === "vendor_missing").length >= 2); // kernelflow + tensormux
 });
 
 test("仓库多 target 激活：common 物理去重只一行、各 delta 并列（CANN OSL 内容不 vendor 的路线）", () => {
+  const skillsRoot = repoSkillsWithoutVendors();
   const reg = SkillsRegistry.create({
-    builtinRoot: join(REPO_ROOT, "skills"), builtin: true, activated: ["ascend", "metax"],
+    builtinRoot: skillsRoot, builtin: true, activated: ["ascend", "metax"],
     globalDir: join(root, "no-global"), projectDir: join(root, "no-proj"), indexBudgetTokens: 4000,
   });
   assert.ok(reg.get("ascend-ascend-notes"));

@@ -11,11 +11,11 @@
       "repo": "https://github.com/AMD-AGI/GEAK",
       "ref": "main",
       "license": "MIT",
-      "subpath": "expert_skills"
+      "subpath": "perf_knowledge/expert_skills"
     },
     "tensormux-kernel-skills": {
       "repo": "https://github.com/tensormux/kernel-skills",
-      "ref": "main",
+      "ref": "master",
       "license": "MIT"
     },
     "kernelflow-cuda-optimizer": {
@@ -30,7 +30,7 @@
     },
     "metax-tileops": {
       "repo": "https://gitee.com/MetaX-MACA/TileOPs-Metax",
-      "ref": "master",
+      "ref": "dev",
       "license": "MIT"
     }
   }

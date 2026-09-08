@@ -771,6 +771,11 @@ export function App({
             ansi.dim(
               `\n  共 ${rs.length} 个 · 索引快照 ≈${Math.round(agent.skillsRegistry.indexBlock.length / 4)} tok · 会话内锁定（文件变更下个会话生效） · /skills <name> 显式注入`,
             ) +
+            (agent.skillsRegistry.availableTargets.filter((t) => !config.skills.targets.includes(t)).length
+              ? ansi.amber(
+                  `\n  ⚠ 未激活的 target：${agent.skillsRegistry.availableTargets.filter((t) => !config.skills.targets.includes(t)).join(", ")} —— forge.config.json → skills.targets 加入并重启生效`,
+                )
+              : "") +
             (agent.skillsRegistry.diagnostics.length
               ? ansi.error(`\n  ⚠ ${agent.skillsRegistry.diagnostics.length} 条诊断（覆盖/缺 vendor 等）`)
               : ""),
@@ -826,7 +831,7 @@ export function App({
         }
       },
     }),
-    [agent, push, mouseOn],
+    [agent, config, push, mouseOn],
   );
 
   const onSubmit = useCallback(

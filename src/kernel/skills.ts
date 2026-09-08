@@ -652,14 +652,17 @@ export class SkillsRegistry {
   readonly diagnostics: SkillsDiagnostic[];
   /** 索引快照：create() 时一次渲染，字节级恒定（前缀缓存安全，D1）。 */
   readonly indexBlock: string;
+  /** targets/ 里全部可用 target 名（含未激活——/skills 提示「还有哪些没开」，发现性用）。 */
+  readonly availableTargets: string[];
   /** 本会话 skill_read 过的 skill 名（主/子 agent 共用注册表 → 并集；压缩摘要第 10 段用）。 */
   private readonly usedNames = new Set<string>();
   private readonly byName = new Map<string, SkillRecord>();
 
-  private constructor(records: SkillRecord[], diagnostics: SkillsDiagnostic[], indexBlock: string) {
+  private constructor(records: SkillRecord[], diagnostics: SkillsDiagnostic[], indexBlock: string, availableTargets: string[]) {
     this.records = records;
     this.diagnostics = diagnostics;
     this.indexBlock = indexBlock;
+    this.availableTargets = availableTargets;
     for (const r of records) this.byName.set(r.name, r);
   }
 
@@ -677,9 +680,11 @@ export class SkillsRegistry {
     const diagnostics: SkillsDiagnostic[] = [];
     let builtin: SkillRecord[] = [];
     const labels: Record<string, string> = {};
+    let available: string[] = [];
     if (opts.builtin && opts.builtinRoot && existsSync(opts.builtinRoot)) {
       const { manifests, diagnostics: md } = loadTargetManifests(join(opts.builtinRoot, "targets"));
       diagnostics.push(...md);
+      available = [...manifests.keys()].sort();
       for (const m of manifests.values()) if (m.label) labels[m.name] = m.label;
       const res = resolveTargets({ builtinRoot: opts.builtinRoot, manifests, activated: opts.activated });
       builtin = res.records;
@@ -724,7 +729,7 @@ export class SkillsRegistry {
     }
 
     const indexBlock = renderIndex(records, opts.indexBudgetTokens ?? 1500, { activated: opts.activated, labels });
-    return new SkillsRegistry(records, diagnostics, indexBlock);
+    return new SkillsRegistry(records, diagnostics, indexBlock, available);
   }
 
   get(name: string): SkillRecord | undefined {

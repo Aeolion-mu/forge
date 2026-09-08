@@ -25,7 +25,9 @@
 | 验证 | 测试 308 → **354**（+46：46 单测 + 3 e2e），typecheck clean。e2e 钉子：磁盘变更后 system prompt 字节不变；skill_read 真链路幂等；子 agent 拿到同一索引字符串 |
 | commits | `6e0db9c` 调研+计划书 · `0bf1f91` 机制实现 · 本笔（LOG + 文档同步） |
 
-细节与坑见 学习路径.md「主题十二」。**待办**：`npm run skills:fetch` 实际拉取 vendor（网络操作）；delta 内容按计划书纪律深化（PR 评审）。
+细节与坑见 学习路径.md「主题十二」。
+
+**后续（同日）**：`npm run skills:fetch` 实拉 6 家 vendor（82 个 skill，端到端验证了 fetch 脚本）；修 lock 三处（GEAK 真实路径 `perf_knowledge/expert_skills`、tensormux 默认分支 master、TileOPs-Metax 默认分支 dev）；仓库测试改用 skills/ 拷贝剔除 vendors（不受本机是否 fetch 影响）；`/skills` 增加「未激活 target」提示（发现性：default 只挂 common 时用户看不到还有 ascend/amd/… 可开）。**待办**：delta 内容按计划书纪律深化（PR 评审）。
 
 ---
 
