@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Text, useInput, usePaste } from "ink";
 import * as ed from "./text-editor.js";
-import { visibleWidth } from "./markdown.js";
+import { normalizeInputSelection, type InputSelection } from "./input-selection.js";
 
 /**
  * 多行输入框 —— 取代单行的 ink-text-input（其多行渲染会糊、且 ↑/↓ 一律翻历史）。
@@ -11,6 +11,8 @@ import { visibleWidth } from "./markdown.js";
  * · ↑/↓：在多行内移动光标；仅当光标在首行按↑、尾行按↓时才翻命令历史（onHistoryPrev/Next）。
  * · 粘贴：ink 批量投递为一段含 \n 的 input，整段插入（不会逐行误触发提交）。
  * · 回车提交；Alt/Shift+回车插入换行（终端支持时）。菜单打开时把 ↑/↓/Tab 让给菜单（父另接）。
+ * · 鼠标：点击定位光标（父换算好字符下标经 cursorRequest 传入）；拖选建立选区
+ *   （selection 反显高亮，父持有状态——打字/删除即替换选中区间并清空）。
  */
 export function MultilineInput({
   value,
@@ -22,6 +24,7 @@ export function MultilineInput({
   isActive,
   cursorRequest,
   onCursorRequestHandled,
+  selection,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -30,9 +33,11 @@ export function MultilineInput({
   onHistoryNext: () => void;
   menuOpen: boolean;
   isActive: boolean;
-  /** 鼠标点击输入框的列号（1-based，相对 `› ` 前缀之后）→ 请求把光标移到该列。消费后调 onCursorRequestHandled 清空。 */
+  /** 鼠标点击输入框的目标字符下标（父已按 `› ` 前缀与宽度折算好）→ 请求把光标移到该处。消费后调 onCursorRequestHandled 清空。 */
   cursorRequest?: number | null;
   onCursorRequestHandled?: () => void;
+  /** 输入选区（value 字符下标 anchor→active）；非退化时反显选中段，光标块隐藏。 */
+  selection?: InputSelection | null;
 }) {
   const [cursor, setCursor] = useState(value.length);
   const emittedRef = useRef(value); // 最近一次「我们自己」改出去的 value
@@ -55,22 +60,13 @@ export function MultilineInput({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
-  // 鼠标点击定位：列号 → 字符下标（按可见宽度折算，中文占 2 列）
+  // 鼠标点击定位：父已换算好字符下标，直接移动（消费后清空请求）。
   useEffect(() => {
     if (cursorRequest == null) return;
-    let acc = 0;
-    let idx = value.length;
-    for (let i = 0; i < value.length; i++) {
-      const w = visibleWidth(value[i]!);
-      if (acc + Math.floor(w / 2) >= cursorRequest) {
-        idx = i;
-        break;
-      }
-      acc += w;
-    }
-    moveCursor(idx);
+    moveCursor(ed.clampCursor(value, cursorRequest));
     onCursorRequestHandled?.();
-  }, [cursorRequest, value, onCursorRequestHandled]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cursorRequest, onCursorRequestHandled]);
 
   const apply = (s: ed.EditorState) => {
     emittedRef.current = s.text;
@@ -102,8 +98,11 @@ export function MultilineInput({
 
       const v = valueRef.current;
       const cur = cursorRef.current;
+      // 选中区间（打字/删除先吃掉选中段——编辑器惯例）；有选区时替换后光标在 start。
+      const sel = normalizeInputSelection(selection ?? null);
+      const st: ed.EditorState = sel ? { text: v, cursor: sel.start } : { text: v, cursor: cur };
       if (key.return) {
-        if (key.meta || key.shift) apply(ed.insert({ text: v, cursor: cur }, "\n"));
+        if (key.meta || key.shift) apply(ed.insert(sel ? ed.removeRange(st, sel.start, sel.end) : st, "\n"));
         else onSubmit(v);
         return;
       }
@@ -121,16 +120,32 @@ export function MultilineInput({
       }
       if (key.leftArrow) return moveCursor(ed.clampCursor(v, cur - 1));
       if (key.rightArrow) return moveCursor(ed.clampCursor(v, cur + 1));
-      if (key.backspace || key.delete) return apply(ed.backspace({ text: v, cursor: cur }));
+      if (key.backspace || key.delete) {
+        // 有选区 → 删除选中段；无选区 → 删光标前一字符
+        apply(sel ? ed.removeRange(st, sel.start, sel.end) : ed.backspace(st));
+        return;
+      }
       if (key.ctrl && input === "a") return moveCursor(ed.lineHome(v, cur));
       if (key.ctrl && input === "e") return moveCursor(ed.lineEnd(v, cur));
-      // 可打印（含批量粘贴，可能带换行）；排除控制/修饰组合
-      if (input && !key.ctrl && !key.meta) apply(ed.insert({ text: v, cursor: cur }, ed.normalizeNewlines(input)));
+      // 可打印（含批量粘贴，可能带换行）；排除控制/修饰组合。有选区 → 替换选中段。
+      if (input && !key.ctrl && !key.meta) {
+        apply(ed.insert(sel ? ed.removeRange(st, sel.start, sel.end) : st, ed.normalizeNewlines(input)));
+      }
     },
     { isActive },
   );
 
-  // 渲染：before + 反显光标块 + after。光标处是换行/末尾时，用空格块代显示。
+  // 渲染：有选区 → 反显选中段（光标块隐藏）；否则 before + 反显光标块 + after。
+  const sel = normalizeInputSelection(selection ?? null);
+  if (sel) {
+    return (
+      <Text>
+        {value.slice(0, sel.start)}
+        <Text inverse>{value.slice(sel.start, sel.end)}</Text>
+        {value.slice(sel.end)}
+      </Text>
+    );
+  }
   const c = ed.clampCursor(value, cursor);
   const before = value.slice(0, c);
   const at = value.slice(c, c + 1);

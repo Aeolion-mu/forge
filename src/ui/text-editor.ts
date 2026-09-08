@@ -34,6 +34,14 @@ export function backspace(s: EditorState): EditorState {
   return { text: s.text.slice(0, cursor - 1) + s.text.slice(cursor), cursor: cursor - 1 };
 }
 
+/** 删除 [from, to) 区间（鼠标选区），光标落在 from。区间自动归一化/钳制。 */
+export function removeRange(s: EditorState, from: number, to: number): EditorState {
+  const a = clampCursor(s.text, Math.min(from, to));
+  const b = clampCursor(s.text, Math.max(from, to));
+  if (a === b) return { text: s.text, cursor: clampCursor(s.text, s.cursor) };
+  return { text: s.text.slice(0, a) + s.text.slice(b), cursor: a };
+}
+
 /** 光标处的行号 / 列号（按 `\n` 逻辑行，均从 0 起）。 */
 export function cursorRowCol(text: string, cursor: number): { row: number; col: number } {
   const c = clampCursor(text, cursor);

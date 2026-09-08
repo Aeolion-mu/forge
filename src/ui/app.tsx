@@ -19,6 +19,7 @@ import { MultilineInput } from "./multiline-input.js";
 import { normalizeRange, lineRangeInSel, highlightRange, plainOf, expandWord, wholeLine, selectedText } from "./selection.js";
 import { copyText } from "./clipboard.js";
 import { replayBlocks, firstUserPreviewSync } from "./session-replay.js";
+import { inputLineCount, inputCharAtScreen, normalizeInputSelection, type InputSelection } from "./input-selection.js";
 import type { JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
 
 // 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
@@ -151,8 +152,16 @@ export function App({
   const [scrollOffset, setScrollOffset] = useState(0);
   // 跟随暂停期间累计的新行数（Jump 按钮「N new」）。
   const [newCount, setNewCount] = useState(0);
-  // 鼠标点击输入框 → 请求把光标移到该列（消费后置 null）。
+  // 鼠标点击输入框 → 请求把光标移到该字符下标（消费后置 null）。
   const [cursorCol, setCursorCol] = useState<number | null>(null);
+  // 输入框内鼠标拖选（value 字符下标 anchor→active）；打字/删除即替换并清空（MultilineInput 内处理）。
+  const [inputSel, setInputSel] = useState<InputSelection | null>(null);
+  const inputSelRef = useRef<InputSelection | null>(null);
+  inputSelRef.current = inputSel;
+  const inputRef = useRef(input);
+  inputRef.current = input;
+  // 输入区拖拽进行时：起点字符下标 + 是否真的拖动了（没动 = 单击定位光标）。
+  const inputDragRef = useRef<{ startChar: number; moved: boolean } | null>(null);
   // /resume · /rewind 的选择器（输入框上方浮层）：↑↓ 选择、Enter 确认、Esc 取消、点击行确认。
   const [picker, setPicker] = useState<{
     kind: "resume" | "rewind";
@@ -468,6 +477,13 @@ export function App({
     if (cur && !busy && working === null && confirm === null) {
       void copySelectionNow(cur.anchor, cur.active);
       setSel(null);
+      return;
+    }
+    // 输入框选区激活且空闲 → Ctrl+C = 复制输入选区；运行中仍优先中止
+    const isel = inputSelRef.current;
+    if (normalizeInputSelection(isel) && !busy && working === null && confirm === null) {
+      void copyInputSelectionNow(isel!.anchor, isel!.active);
+      setInputSel(null);
       return;
     }
     const action = ctrlCAction({
@@ -839,6 +855,8 @@ export function App({
   const jumpLine = scrollOffset > 0 ? 1 : 0;
   const menuLines = menuOpen && !confirm ? menuMatches.length + 1 : 0;
   const pickerLines = picker ? picker.items.length + 1 : 0;
+  // 输入框内容行数（多行输入时随之增高；超长行的终端折行不计——点击列映射按逻辑行近似）。
+  const inputLines = inputLineCount(input);
   // 子 agent 用量行与状态行只在「有 running」时出现——全部结束后随状态行一起消失。
   const subDashLines = agent.subTelemetry.turns > 0 && anySubRunning ? 1 : 0;
   const subRowLines = subRunning.length;
@@ -853,7 +871,8 @@ export function App({
     menuLines +
     pickerLines +
     subHeaderLine +
-    3 + // 输入框：上下边框 + 内容行
+    2 + // 输入框上下边框
+    inputLines + // 输入内容行（多行输入随之增高）
     1 + // 仪表盘
     subDashLines +
     subRowLines;
@@ -913,7 +932,7 @@ export function App({
     }
     row += 1; // 输入框上边框
     z.inputRow = row + 1;
-    row += 2; // 输入内容行 + 下边框
+    row += inputLines + 1; // 输入内容行（多行）+ 下边框
     row += 1; // 仪表盘
     row += subDashLines;
     if (subRowLines) z.subTop = row + 1; // 第一个子 agent 状态行
@@ -940,6 +959,18 @@ export function App({
     [push],
   );
 
+  /** 复制输入框选区（拖选松开即复制 / Ctrl+C 手动）。 */
+  const copyInputSelectionNow = useCallback(
+    async (anchor: number, active: number) => {
+      if (process.env.FORGE_COPY_ON_SELECT === "0") return;
+      const text = inputRef.current.slice(Math.min(anchor, active), Math.max(anchor, active));
+      if (!text.trim()) return;
+      const r = await copyText(text);
+      setToast(`⧉ 已复制输入框 ${text.length} 字符 → ${r.path}`);
+    },
+    [],
+  );
+
   useEffect(() => {
     return mouseStdin.onMouseEvent((ev: MouseEvent) => {
       const total = flatRef.current.lines.length;
@@ -961,17 +992,33 @@ export function App({
         return v.start + (row - 1);
       };
       const textCol = (col: number) => Math.max(0, col - 1); // 屏幕 1-based → 行内 0-based 可见列
+      // 输入区行命中 + 屏幕坐标 → 输入 value 字符下标（`› ` 前缀 / 多行 / CJK 宽度统一换算）。
+      const inInputRows = (row: number) => z.inputRow !== null && row >= z.inputRow && row < z.inputRow + inputLineCount(inputRef.current);
+      const charAtInput = (row: number, col: number): number | null => inputCharAtScreen(inputRef.current, z.inputRow ?? row, row, col);
 
-      // ── 按下：记拖拽起点（视口内才可能拖选；先不动作，等松开区分单击/拖拽）──
+      // ── 按下：记拖拽起点（视口/输入区才可能拖选；先不动作，等松开区分单击/拖拽）──
       if (ev.kind === "press") {
         dragRef.current = inViewport
           ? { startRow: ev.row, startLine: lineUnder(ev.row), startCol: textCol(ev.col), moved: false }
+          : null;
+        inputDragRef.current = !inViewport && inInputRows(ev.row)
+          ? { startChar: charAtInput(ev.row, ev.col) ?? 0, moved: false }
           : null;
         return;
       }
 
       // ── 拖动：跨格才算选择；拖到视口上下边缘自动滚 1 行 ──
       if (ev.kind === "motion") {
+        // 输入区拖选：字符下标变化才算移动；选中段实时反显。
+        const idr = inputDragRef.current;
+        if (idr) {
+          const ch = charAtInput(ev.row, ev.col);
+          if (ch !== null) {
+            if (!idr.moved && ch !== idr.startChar) idr.moved = true;
+            if (idr.moved) setInputSel({ anchor: idr.startChar, active: ch });
+          }
+          return;
+        }
         const d = dragRef.current;
         if (!d) return;
         if (!d.moved && (ev.row !== d.startRow || ev.col !== d.startCol)) d.moved = true;
@@ -993,12 +1040,21 @@ export function App({
       if (ev.kind === "release") {
         const d = dragRef.current;
         dragRef.current = null;
+        const idr = inputDragRef.current;
+        inputDragRef.current = null;
         if (d?.moved) {
           // 拖拽结束：定格选区 + 松开即复制
           const anchor = { line: d.startLine, col: d.startCol };
           const active = { line: lineUnder(ev.row), col: textCol(ev.col) };
           setSel({ anchor, active });
           void copySelectionNow(anchor, active);
+          return;
+        }
+        // 输入区拖选结束：定格输入选区 + 松开即复制（与视口 copy-on-select 一致）
+        if (idr?.moved) {
+          const ch = charAtInput(ev.row, ev.col) ?? idr.startChar;
+          setInputSel({ anchor: idr.startChar, active: ch });
+          void copyInputSelectionNow(idr.startChar, ch);
           return;
         }
         // 单击：先双击/三击判定（同格 <500ms）——二击选词、三击选行，选中即复制
@@ -1032,8 +1088,10 @@ export function App({
           setMenuIdx(ev.row - z.menuTop);
           return;
         }
-        if (z.inputRow === ev.row && confirm === null) {
-          setCursorCol(Math.max(0, ev.col - 2)); // `› ` 前缀占 2 列
+        if (z.inputRow !== null && inInputRows(ev.row) && confirm === null) {
+          setInputSel(null); // 单击清输入选区（与视口单击清选区一致）
+          const ch = charAtInput(ev.row, ev.col);
+          if (ch !== null) setCursorCol(ch); // `› ` 前缀/多行/CJK 已在换算内处理
           return;
         }
         // 子 agent 状态行：点击切换到该子 agent 的上下文（查看/插话）
@@ -1064,7 +1122,7 @@ export function App({
         }
       }
     });
-  }, [mouseStdin, confirm, menuMatches.length, jumpToBottom, toggleToolBlock, copySelectionNow, openSubView, closeSubView, bumpSub]);
+  }, [mouseStdin, confirm, menuMatches.length, jumpToBottom, toggleToolBlock, copySelectionNow, copyInputSelectionNow, openSubView, closeSubView, bumpSub]);
 
   const visStartRef = useRef(vis.start);
   visStartRef.current = vis.start;
@@ -1173,7 +1231,7 @@ export function App({
             <Text color={theme.prompt}>{"› "}</Text>
             <MultilineInput
               value={input}
-              onChange={(v) => { setInput(v); setMenuIdx(0); }}
+              onChange={(v) => { setInput(v); setMenuIdx(0); setInputSel(null); }}
               onSubmit={onSubmit}
               onHistoryPrev={historyPrev}
               onHistoryNext={historyNext}
@@ -1181,6 +1239,7 @@ export function App({
               isActive={confirm === null && picker === null}
               cursorRequest={cursorCol}
               onCursorRequestHandled={() => setCursorCol(null)}
+              selection={inputSel}
             />
             {!input && (
               <Text color={theme.muted}>
