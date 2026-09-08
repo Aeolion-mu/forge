@@ -665,10 +665,13 @@ export function App({
   }, []);
 
   // 命令历史翻页（MultilineInput 在首行↑ / 尾行↓ 时回调）。histIdx=null 表示在编辑新输入。
+  // 历史浏览期间暂存草稿：↑ 进入浏览时记住未提交的输入，↓ 翻回最新时原样恢复（不丢字）。
+  const draftRef = useRef<string | null>(null);
   const historyPrev = useCallback(() => {
     const h = historyRef.current;
     if (h.length === 0) return;
     const cur = histIdxRef.current;
+    if (cur === null) draftRef.current = inputRef.current; // 首次进入浏览：存草稿
     const idx = cur === null ? h.length - 1 : Math.max(0, cur - 1);
     histIdxRef.current = idx;
     setInput(h[idx]!);
@@ -679,7 +682,8 @@ export function App({
     if (cur === null) return; // 已是最新草稿
     if (cur >= h.length - 1) {
       histIdxRef.current = null;
-      setInput("");
+      setInput(draftRef.current ?? ""); // 翻回最新：恢复进入浏览前的草稿
+      draftRef.current = null;
     } else {
       const idx = cur + 1;
       histIdxRef.current = idx;
@@ -763,6 +767,7 @@ export function App({
       const h = historyRef.current;
       if (h[h.length - 1] !== line) h.push(line);
       histIdxRef.current = null;
+      draftRef.current = null;
       if (line === "/exit" || line === "/quit") {
         exit();
         return;

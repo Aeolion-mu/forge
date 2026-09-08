@@ -257,3 +257,55 @@ test("App 交互：对已结束的子 agent 插话被拒绝并提示", async () 
     h.unmount();
   }
 });
+
+test("App 交互：输入框 ↑/↓ 翻历史输入记录（含草稿保护）", async () => {
+  resetBlockCache();
+  const h = mountApp();
+  /** 输入框内容行（两条边框线之间那行 `› …`）——历史断言必须看这里而非整帧（转录区也有 › 前缀的用户块）。 */
+  const inputRow = (frame: string): string => {
+    const m = frame.match(/─+\n(›[^\n]*)\n─+/);
+    return m ? m[1]! : "";
+  };
+  try {
+    await h.flush();
+    // 发两条消息进历史
+    h.write("第一条消息\r");
+    await h.flush();
+    h.write("第二条消息\r");
+    await h.flush();
+    assert.equal(inputRow(h.frame()), "›  Type a request · /exit to quit", "提交后输入应为空");
+
+    // ↑ → 召回最近一条（第二条）
+    h.write("\x1b[A");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("第二条消息"), `↑ 应召回最近一条历史：\n${h.frame()}`);
+
+    // 再 ↑ → 上一条（第一条）；↑ 到头后停留（不循环）
+    h.write("\x1b[A");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("第一条消息"), "再↑ 应到更早一条");
+    h.write("\x1b[A");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("第一条消息"), "到最早已历史应停留");
+
+    // ↓ → 回到下一条（第二条）；再 ↓ 翻过最新 → 回到空草稿
+    h.write("\x1b[B");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("第二条消息"), "↓ 应翻回较新一条");
+    h.write("\x1b[B");
+    await h.flush();
+    assert.match(inputRow(h.frame()), /Type a request/, "↓ 翻过最新一条应清回新草稿");
+
+    // 草稿保护：输入未提交草稿 → ↑ 浏览历史 → ↓ 翻回最新 → 草稿原样恢复
+    h.write("还没写完的草稿");
+    await h.flush();
+    h.write("\x1b[A"); // 进入浏览（存草稿）
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("第二条消息"), "浏览中显示历史");
+    h.write("\x1b[B"); // 翻回最新 → 恢复草稿
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("还没写完的草稿"), `↓ 到底应恢复进入浏览前的草稿：\n${h.frame()}`);
+  } finally {
+    h.unmount();
+  }
+});
