@@ -24,6 +24,7 @@ import type { JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
 // 写类工具在 tool_start 显示的动词表头（diff 详情在 end 补上）。
 const WRITE_VERB: Record<string, string> = { edit_file: "Update", write_file: "Write" };
 import { ForgeAgent } from "../kernel/forge-agent.js";
+import type { SubAgentInfo } from "../tools/subagent.js";
 import type { ForgeConfig } from "../config.js";
 
 /** 是否为中止类错误（Ctrl+C 触发，不当作错误提示）。 */
@@ -47,6 +48,31 @@ function human(n: number): string {
   return String(n);
 }
 
+/** tool_end 事件 → 结果体（主 agent 与子 agent transcript 共用的构造）。 */
+function buildToolBody(e: { result?: unknown; isError?: boolean }): ToolBody | undefined {
+  const details = (e.result as { details?: { diff?: FileDiff; diffs?: FileDiff[] } } | undefined)?.details;
+  const fullText = String((e.result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text ?? "");
+  if (details?.diff) return { kind: "diff", diffs: [details.diff] };
+  if (Array.isArray(details?.diffs)) return { kind: "diff", diffs: details.diffs };
+  return fullText
+    ? {
+        kind: "text",
+        preview: (readFileResultLine(details) ?? fullText.split("\n")[0] ?? "").slice(0, 80) || "(无输出)",
+        full: fullText,
+        isError: e.isError,
+      }
+    : undefined;
+}
+
+/** tool_start 事件 → 头部行（主 agent 与子 agent transcript 共用的构造）。 */
+function buildToolHeader(e: { toolName: string; args?: unknown }): string {
+  const verb = WRITE_VERB[e.toolName];
+  const path = (e.args as { path?: string } | undefined)?.path;
+  if (verb && path) return `${ansi.tool("●")} ${ansi.bold(`${verb}(${path})`)}`;
+  if (e.toolName === "apply_patch") return `${ansi.tool("●")} ${ansi.bold("Patch")}`;
+  return `${ansi.tool("●")} ${ansi.bold(e.toolName)}${ansi.dim(`(${summarizeToolArgs(e.toolName, e.args)})`)}`;
+}
+
 interface ConfirmReq {
   tool: string;
   args: unknown;
@@ -59,10 +85,12 @@ export interface AppBridge {
   notice: (msg: string) => void;
   /** 长操作实时状态（压缩进度等）；null 关闭进度行。 */
   status: (msg: string | null) => void;
-  /** 子 agent 实时状态（挂仪表盘下方）；null 关闭。 */
-  subagent: (msg: string | null) => void;
+  /** 子 agent 注册表有变化（spawn/进度/结束）时 ping；App 重读 listSubAgents 渲染状态行。 */
+  subagent: () => void;
   /** 后台子 agent 完成 → 作为新一轮喂回主 agent（串行调度，不阻塞）。 */
   resume: (text: string) => void;
+  /** 后台子 agent 的事件流（id + 事件）：App 维护每个子 agent 的 transcript，供上下文切换。 */
+  subagentEvent: (id: string, e: HarnessEvent) => void;
   /** Convergent 验收 agent 的事件流：渲染成带 ⟢ 前缀的活动块。 */
   convergentEvent: (e: HarnessEvent) => void;
   /** /resume 选中会话 → 通知 index 重启循环换会话（App 随即 exit）。 */
@@ -102,8 +130,21 @@ export function App({
   const [dash, setDash] = useState({ turns: 0, inTok: 0, outTok: 0, cost: 0, ctxUsed: 0, cacheHit: 0 });
   // 长操作进度（压缩等）：非 null 时在输入框上方显示动态状态行。
   const [working, setWorking] = useState<string | null>(null);
-  // 子 agent 实时状态：挂仪表盘下方。
-  const [subStatus, setSubStatus] = useState<string | null>(null);
+  // 子 agent 重绘信号：注册表 ping / transcript 新 block / 秒级走时 → bump 触发重渲染
+  //（状态行与子 transcript 都从 ref/live 数据读，不进 React state）。
+  const [subTick, setSubTick] = useState(0);
+  const bumpSub = useCallback(() => setSubTick((x) => x + 1), []);
+  // 当前查看的上下文：主 agent 或某个子 agent（点击状态行 / /agents <id> 进入，Esc 返回）。
+  const [view, setView] = useState<{ kind: "main" } | { kind: "sub"; id: string }>({ kind: "main" });
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  // running 子 agent 清单的同步镜像（鼠标命中闭包读，避免 stale）。
+  const subRunningRef = useRef<SubAgentInfo[]>([]);
+  const subAgentsRef = useRef<SubAgentInfo[]>([]);
+  // 每个子 agent 的 transcript（block 列表 + 流式文本缓冲）。block id 用独立计数器，
+  // 与主转录靠 flattenBlocks 的 ns（"sub:<id>"）隔离渲染缓存键。
+  const subTranscriptsRef = useRef(new Map<string, { blocks: Block[]; buf: string }>());
+  const subIdRef = useRef(0);
   // 斜杠命令菜单当前选中项下标。
   const [menuIdx, setMenuIdx] = useState(0);
   // 视口滚动：offset = 视口底边之上的隐藏行数（0 = 跟随底部）。
@@ -165,6 +206,90 @@ export function App({
     setBlocks((prev) => [...prev, { ...b, id: idRef.current++ } as Block]);
   }, []);
   const push = useCallback((text: string) => pushBlock({ kind: "plain", text }), [pushBlock]);
+
+  // ── 子 agent transcript（上下文切换查看）────────────────────────────────────
+  /** 取/建某子 agent 的 transcript；首次访问时先种一条「指派任务」user block。 */
+  const subTranscriptOf = useCallback(
+    (id: string): { blocks: Block[]; buf: string } => {
+      const map = subTranscriptsRef.current;
+      let t = map.get(id);
+      if (!t) {
+        t = { blocks: [], buf: "" };
+        const info = agent.listSubAgents().find((x) => x.id === id);
+        t.blocks.push({ id: subIdRef.current++, kind: "user", text: info ? `${info.task}\n${ansi.dim(`（子任务 · ${info.id}[${info.role}]）`)}` : "(任务原文不可用)" });
+        map.set(id, t);
+      }
+      return t;
+    },
+    [agent],
+  );
+  const pushSubBlock = useCallback(
+    (id: string, b: NewBlock) => {
+      const t = subTranscriptOf(id);
+      t.blocks.push({ ...b, id: subIdRef.current++ } as Block);
+      bumpSub();
+    },
+    [subTranscriptOf, bumpSub],
+  );
+  /** 子 agent 事件流 → 其 transcript 的 block（比主流程轻：无 spinner/仪表盘，turn 行收尾）。 */
+  const handleSubEvent = useCallback(
+    (id: string, e: HarnessEvent) => {
+      const t = subTranscriptOf(id);
+      switch (e.type) {
+        case "message_start":
+          if ((e.message as { role?: string }).role === "assistant") t.buf = "";
+          break;
+        case "message_update": {
+          const ev = e.event as { type: string; delta?: string };
+          if (ev.type === "text_delta" && ev.delta) t.buf += ev.delta;
+          break;
+        }
+        case "message_end":
+          if ((e.message as { role?: string }).role === "assistant") {
+            const txt = t.buf.trim();
+            if (txt) t.blocks.push({ id: subIdRef.current++, kind: "markdown", source: txt });
+            t.buf = "";
+            bumpSub();
+          }
+          break;
+        case "tool_start":
+          t.blocks.push({ id: subIdRef.current++, kind: "tool", toolCallId: e.toolCallId, header: buildToolHeader(e) });
+          bumpSub();
+          break;
+        case "tool_end": {
+          const body = buildToolBody(e);
+          for (let i = t.blocks.length - 1; i >= 0; i--) {
+            const b = t.blocks[i]!;
+            if (b.kind === "tool" && b.toolCallId === e.toolCallId) {
+              t.blocks[i] = { ...b, body, collapsed: body ? defaultCollapsed(body) : false };
+              break;
+            }
+          }
+          bumpSub();
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    [subTranscriptOf, bumpSub],
+  );
+  /** 切到某子 agent 的上下文（点击状态行 / /agents <id>）；重置滚动钉底。 */
+  const openSubView = useCallback(
+    (id: string) => {
+      subTranscriptOf(id); // 确保 transcript 存在（种任务 block）
+      setView({ kind: "sub", id });
+      setScrollOffset(0);
+      setNewCount(0);
+    },
+    [subTranscriptOf],
+  );
+  /** 返回主上下文（Esc / 点击子视图头部）。 */
+  const closeSubView = useCallback(() => {
+    setView({ kind: "main" });
+    setScrollOffset(0);
+    setNewCount(0);
+  }, []);
 
   // working 从无到有 → 记起始；归零 → 复位（phase 更新不重置计时）
   useEffect(() => {
@@ -251,33 +376,11 @@ export function App({
           break;
         }
         case "tool_start": {
-          const verb = WRITE_VERB[e.toolName];
-          const path = (e.args as { path?: string } | undefined)?.path;
-          const header =
-            verb && path
-              ? `${ansi.tool("●")} ${ansi.bold(`${verb}(${path})`)}`
-              : e.toolName === "apply_patch"
-                ? `${ansi.tool("●")} ${ansi.bold("Patch")}`
-                : `${ansi.tool("●")} ${ansi.bold(e.toolName)}${ansi.dim(`(${summarizeToolArgs(e.toolName, e.args)})`)}`;
-          pushBlock({ kind: "tool", toolCallId: e.toolCallId, header });
+          pushBlock({ kind: "tool", toolCallId: e.toolCallId, header: buildToolHeader(e) });
           break;
         }
         case "tool_end": {
-          const details = (e.result as { details?: { diff?: FileDiff; diffs?: FileDiff[] } } | undefined)?.details;
-          const fullText = String((e.result?.content?.[0] as { text?: string } | undefined)?.text ?? "");
-          const body: ToolBody | undefined = details?.diff
-            ? { kind: "diff", diffs: [details.diff] }
-            : Array.isArray(details?.diffs)
-              ? { kind: "diff", diffs: details.diffs }
-              : fullText
-                ? {
-                    kind: "text",
-                    preview:
-                      (readFileResultLine(details) ?? fullText.split("\n")[0] ?? "").slice(0, 80) || "(无输出)",
-                    full: fullText,
-                    isError: e.isError,
-                  }
-                : undefined;
+          const body = buildToolBody(e);
           // 找到 tool_start 留下的 block，补上结果体（头部+结果同 block → 点击一起折叠）
           setBlocks((prev) => {
             for (let i = prev.length - 1; i >= 0; i--) {
@@ -315,7 +418,8 @@ export function App({
     bridge.confirm = (tool, args) => new Promise<boolean>((resolve) => setConfirm({ tool, args, resolve }));
     bridge.notice = (msg) => push(msg.replace(/\n+$/, ""));
     bridge.status = (msg) => setWorking(msg);
-    bridge.subagent = (msg) => setSubStatus(msg);
+    bridge.subagent = () => bumpSub(); // 注册表变化 → 重读 listSubAgents 重画状态行
+    bridge.subagentEvent = (id, e) => handleSubEvent(id, e);
     bridge.resume = (text) => {
       push(ansi.dim("↳ 收到结果，主 agent 继续…"));
       runMain(text);
@@ -347,7 +451,7 @@ export function App({
           break;
       }
     };
-  }, [bridge, push, pushBlock, runMain]);
+  }, [bridge, push, pushBlock, runMain, bumpSub, handleSubEvent]);
 
   // busy 或长操作进行中：驱动 spinner / 状态行 / 计时刷新
   useEffect(() => {
@@ -396,12 +500,13 @@ export function App({
     }
   });
 
-  // 选区键盘互作：Esc 清选区；打字清选区；Shift+←/→ 移动活动端扩展（跨行边界）
+  // 选区键盘互作：Esc 返回主上下文（子视图中）/ 清选区；打字清选区；Shift+←/→ 移动活动端扩展
   useInput(
     (input, key) => {
       const cur = selRef.current;
       if (key.escape) {
-        setSel(null);
+        if (viewRef.current.kind === "sub") closeSubView(); // 先返回主上下文
+        else setSel(null);
         return;
       }
       if (key.shift && (key.leftArrow || key.rightArrow)) {
@@ -613,6 +718,14 @@ export function App({
             : ansi.dim("鼠标捕获已关闭——现在可以拖拽选择文本、Cmd+C 复制（滚轮/点击失效，键盘 PgUp/PgDn 仍可滚动）。/mouse 重新开启。"),
         );
       },
+      "/agents": () => {
+        const xs = agent.listSubAgents();
+        if (!xs.length) return push(ansi.dim("暂无子 agent——主 agent spawn_subagent 后会出现在底部状态行（可点击查看）。"));
+        push(
+          xs.map((x) => `  ${x.id} [${x.role}] ${x.status} · ${x.turns} 轮 / ${x.tools} 工具 · ${x.elapsedSec}s`).join("\n") +
+            ansi.dim("\n  /agents <id> 查看其上下文；运行中的也可点击底部状态行进入；子视图内输入 = 插话"),
+        );
+      },
       "/compact": async () => {
         try {
           await agent.compactNow();
@@ -650,15 +763,37 @@ export function App({
         }
         return;
       }
+      // /agents 也是带参命令（/agents · /agents <id>），单独处理
+      if (line === "/agents" || line.startsWith("/agents ")) {
+        const arg = line.slice("/agents".length).trim();
+        if (!arg) {
+          const xs = agent.listSubAgents();
+          push(xs.length ? xs.map((x) => `  ${x.id} [${x.role}] ${x.status} · ${x.turns} 轮 / ${x.tools} 工具 · ${x.elapsedSec}s`).join("\n") + ansi.dim("\n  /agents <id> 查看其上下文（Esc 返回；子视图内输入 = 插话）") : ansi.dim("暂无子 agent——主 agent spawn_subagent 后会出现在底部状态行（可点击查看）。"));
+        } else if (agent.listSubAgents().some((x) => x.id === arg)) openSubView(arg);
+        else push(ansi.error(`无此子 agent：${arg}（/agents 查看清单）`));
+        return;
+      }
       const handler = slashHandlers[line];
       if (handler) {
         await handler();
         return;
       }
+      // 子 agent 视图内：普通输入 = 对该子 agent 插话（steer，当前步后送达）
+      const v = viewRef.current;
+      if (v.kind === "sub") {
+        const rec = agent.listSubAgents().find((x) => x.id === v.id);
+        pushSubBlock(v.id, { kind: "user", text: line });
+        if (rec?.status === "running") {
+          pushSubBlock(v.id, { kind: "plain", text: ansi.dim(`↳ ${agent.steerSubAgent(v.id, line)}`) });
+        } else {
+          pushSubBlock(v.id, { kind: "plain", text: ansi.error(`该子 agent 已${rec ? ` ${rec.status}` : "不存在"}，无法插话——按 Esc 返回主上下文`) });
+        }
+        return;
+      }
       // 忙时插话(steer 注入当前 run) / 闲时新任务(enqueue)，均不阻塞输入
       if (queueRef.current.submit(line) === "steered") push(ansi.dim("↳ 已插入当前任务 — 本步完成后送达"));
     },
-    [agent, exit, push, pushBlock, menuIdx, runMain, slashHandlers],
+    [agent, exit, push, pushBlock, pushSubBlock, openSubView, menuIdx, runMain, slashHandlers],
   );
 
   // ── 视口与布局（每帧重算；block 行渲染有 (id,width) 记忆化兜底）──────────────────
@@ -673,6 +808,28 @@ export function App({
 
   const width = Math.max(20, termCols);
   const flat = useMemo(() => flattenBlocks(blocks, width), [blocks, width]);
+  // 子 agent 实时清单（渲染期直读注册表；bumpSub/秒级 tick 驱动重渲染）。
+  const subAgents = agent.listSubAgents();
+  const subRunning = subAgents.filter((a) => a.status === "running");
+  const subViewInfo = view.kind === "sub" ? subAgents.find((x) => x.id === view.id) : undefined;
+  subRunningRef.current = subRunning;
+  subAgentsRef.current = subAgents;
+
+  // 当前查看上下文对应的 flat：主转录或某子 agent 的 transcript（ns 隔离渲染缓存）。
+  // subTick 进 deps：transcript 只存在 ref 里，靠它感知新增 block。
+  const activeFlat = useMemo(() => {
+    if (view.kind !== "sub") return flat;
+    return flattenBlocks(subTranscriptsRef.current.get(view.id)?.blocks ?? [], width, `sub:${view.id}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, flat, width, subTick]);
+
+  // 状态行的已运行秒数走秒（无 running 时不开计时器——行也全部消失）。
+  const anySubRunning = subRunning.length > 0;
+  useEffect(() => {
+    if (!anySubRunning) return;
+    const id = setInterval(() => setSubTick((x) => x + 1), 500);
+    return () => clearInterval(id);
+  }, [anySubRunning]);
 
   // chrome（视口之下的固定区）各段行数，自上而下：
   const reasoningLines =
@@ -682,8 +839,10 @@ export function App({
   const jumpLine = scrollOffset > 0 ? 1 : 0;
   const menuLines = menuOpen && !confirm ? menuMatches.length + 1 : 0;
   const pickerLines = picker ? picker.items.length + 1 : 0;
-  const subDashLines = agent.subTelemetry.turns > 0 ? 1 : 0;
-  const subStatusLines = subStatus ? 1 : 0;
+  // 子 agent 用量行与状态行只在「有 running」时出现——全部结束后随状态行一起消失。
+  const subDashLines = agent.subTelemetry.turns > 0 && anySubRunning ? 1 : 0;
+  const subRowLines = subRunning.length;
+  const subHeaderLine = view.kind === "sub" ? 1 : 0;
   const toastLine = toast ? 1 : 0;
   const chromeHeight =
     toastLine +
@@ -693,44 +852,47 @@ export function App({
     (working ? 1 : 0) +
     menuLines +
     pickerLines +
+    subHeaderLine +
     3 + // 输入框：上下边框 + 内容行
     1 + // 仪表盘
     subDashLines +
-    subStatusLines;
+    subRowLines;
   // 视口高度 = 终端行数 − chrome − 1 安全行：帧高恰好顶满终端时，写最后一行会引发
   // 屏幕上滚一格 → 整帧错位级联（实测 PTY 里字符逐行炸开）。留 1 行余量根治。
   const viewportHeight = Math.max(0, termRows - chromeHeight - 1);
 
-  const vis = visible({ total: flat.lines.length, height: viewportHeight, offset: scrollOffset });
+  const vis = visible({ total: activeFlat.lines.length, height: viewportHeight, offset: scrollOffset });
   // offset 被钳制（resize/内容缩短）时同步回 state
   if (vis.clampedOffset !== scrollOffset) setScrollOffset(vis.clampedOffset);
 
   // 跟随暂停时累计新行；恢复跟随时清零
   useEffect(() => {
-    const total = flat.lines.length;
+    const total = activeFlat.lines.length;
     const delta = total - prevTotalRef.current;
     prevTotalRef.current = total;
     if (delta > 0 && scrollOffsetRef.current > 0) setNewCount((n) => n + delta);
     else if (scrollOffsetRef.current === 0) setNewCount(0);
-  }, [flat.lines.length]);
+  }, [activeFlat.lines.length]);
 
-  // 供输入处理闭包读的「本帧」值
-  const flatRef = useRef(flat);
-  flatRef.current = flat;
+  // 供输入处理闭包读的「本帧」值（flat = 当前查看上下文的行）
+  const flatRef = useRef(activeFlat);
+  flatRef.current = activeFlat;
   const viewportHeightRef = useRef(viewportHeight);
   viewportHeightRef.current = viewportHeight;
 
   // 可见行 → blockId 映射 + chrome 各可点区行号（屏幕 1-based 行）——每次渲染后更新供鼠标命中
-  const zonesRef = useRef<{ viewportRows: number; jumpRow: number | null; menuTop: number | null; pickerTop: number | null; inputRow: number | null }>({
+  const zonesRef = useRef<{ viewportRows: number; jumpRow: number | null; menuTop: number | null; pickerTop: number | null; inputRow: number | null; subHeaderRow: number | null; subTop: number | null }>({
     viewportRows: 0,
     jumpRow: null,
     menuTop: null,
     pickerTop: null,
     inputRow: null,
+    subHeaderRow: null,
+    subTop: null,
   });
   zonesRef.current = (() => {
     let row = viewportHeight; // 视口占 1..viewportHeight
-    const z = { viewportRows: viewportHeight, jumpRow: null as number | null, menuTop: null as number | null, pickerTop: null as number | null, inputRow: null as number | null };
+    const z = { viewportRows: viewportHeight, jumpRow: null as number | null, menuTop: null as number | null, pickerTop: null as number | null, inputRow: null as number | null, subHeaderRow: null as number | null, subTop: null as number | null };
     row += toastLine;
     row += jumpLine;
     if (jumpLine) z.jumpRow = row;
@@ -745,8 +907,16 @@ export function App({
       z.pickerTop = row + 1;
       row += pickerLines;
     }
+    if (subHeaderLine) {
+      z.subHeaderRow = row + 1; // 子视图头部（点击返回主上下文）
+      row += subHeaderLine;
+    }
     row += 1; // 输入框上边框
     z.inputRow = row + 1;
+    row += 2; // 输入内容行 + 下边框
+    row += 1; // 仪表盘
+    row += subDashLines;
+    if (subRowLines) z.subTop = row + 1; // 第一个子 agent 状态行
     return z;
   })();
 
@@ -850,7 +1020,7 @@ export function App({
           }
           setSel(null); // 普通单击清选区
         }
-        // 既有单击路由：Jump 按钮 / 菜单 / 输入框定位 / 工具折叠
+        // 既有单击路由：Jump 按钮 / 菜单 / 输入框定位 / 子 agent 切换 / 工具折叠
         if (z.jumpRow === ev.row) return jumpToBottom();
         if (z.pickerTop !== null && ev.row >= z.pickerTop && ev.row < z.pickerTop + (pickerRef.current?.items.length ?? 0)) {
           const idx = ev.row - z.pickerTop;
@@ -866,17 +1036,35 @@ export function App({
           setCursorCol(Math.max(0, ev.col - 2)); // `› ` 前缀占 2 列
           return;
         }
+        // 子 agent 状态行：点击切换到该子 agent 的上下文（查看/插话）
+        if (z.subTop !== null && ev.row >= z.subTop && ev.row < z.subTop + subRunningRef.current.length) {
+          openSubView(subRunningRef.current[ev.row - z.subTop]!.id);
+          return;
+        }
+        // 子视图头部：点击返回主上下文
+        if (z.subHeaderRow === ev.row) return closeSubView();
         if (inViewport) {
           const lineIdx = lineUnder(ev.row);
           const blockId = flatRef.current.owner[lineIdx];
           if (blockId !== undefined) {
-            const b = blocksRef.current.find((x) => x.id === blockId);
-            if (b?.kind === "tool" && b.body) toggleToolBlock(b.id);
+            // 工具块折叠切换作用于「当前查看的上下文」（主转录或某子 agent transcript）
+            if (viewRef.current.kind === "sub") {
+              const t = subTranscriptsRef.current.get(viewRef.current.id);
+              const b = t?.blocks.find((x) => x.id === blockId);
+              if (b?.kind === "tool" && b.body) {
+                t!.blocks = t!.blocks.map((x) => (x.id === b.id && x.kind === "tool" && x.body ? { ...x, collapsed: !x.collapsed } : x));
+                setSel(null); // 折叠切换会让行号重排，选区失效
+                bumpSub();
+              }
+            } else {
+              const b = blocksRef.current.find((x) => x.id === blockId);
+              if (b?.kind === "tool" && b.body) toggleToolBlock(b.id);
+            }
           }
         }
       }
     });
-  }, [mouseStdin, confirm, menuMatches.length, jumpToBottom, toggleToolBlock, copySelectionNow]);
+  }, [mouseStdin, confirm, menuMatches.length, jumpToBottom, toggleToolBlock, copySelectionNow, openSubView, closeSubView, bumpSub]);
 
   const visStartRef = useRef(vis.start);
   visStartRef.current = vis.start;
@@ -885,7 +1073,7 @@ export function App({
 
   // 视口行 + 选区高亮（区间内选择性反显；中间行整行 = [0, ∞)）
   const selRange = sel ? normalizeRange(sel.anchor, sel.active) : null;
-  const viewportText = flat.lines
+  const viewportText = activeFlat.lines
     .slice(vis.start, vis.start + vis.count)
     .map((l, i) => {
       if (!selRange) return l;
@@ -962,6 +1150,17 @@ export function App({
         </Box>
       )}
 
+      {view.kind === "sub" && (
+        <Box>
+          <Text color={theme.prompt}>‹ Esc / 点击返回主上下文</Text>
+          <Text color={theme.muted}>
+            {` · ${view.id}[${subViewInfo?.role ?? "?"}] ${subViewInfo?.status ?? "未知"} · t${subViewInfo?.turns ?? 0} · ${
+              subViewInfo?.status === "running" ? "输入=对该子 agent 插话" : "已结束（输入不可插话）"
+            }`}
+          </Text>
+        </Box>
+      )}
+
       <Box borderStyle="single" borderColor={theme.muted} borderLeft={false} borderRight={false}>
         {confirm ? (
           <Text>
@@ -983,7 +1182,11 @@ export function App({
               cursorRequest={cursorCol}
               onCursorRequestHandled={() => setCursorCol(null)}
             />
-            {!input && <Text color={theme.muted}>Type a request · /exit to quit</Text>}
+            {!input && (
+              <Text color={theme.muted}>
+                {view.kind === "sub" ? "插话该子 agent · Esc 返回主上下文" : "Type a request · /exit to quit"}
+              </Text>
+            )}
           </Box>
         )}
       </Box>
@@ -1001,7 +1204,7 @@ export function App({
         </Text>
       </Box>
 
-      {agent.subTelemetry.turns > 0 && (
+      {agent.subTelemetry.turns > 0 && anySubRunning && (
         <Box>
           <Text color={theme.muted}>
             ▌ {agent.subTelemetry.model || "subagent"} · {agent.subTelemetry.turns} turns · ↑{human(agent.subTelemetry.inputTokens)} ↓
@@ -1010,11 +1213,13 @@ export function App({
         </Box>
       )}
 
-      {subStatus && (
-        <Box>
-          <Text color={theme.amber}>{subStatus}</Text>
+      {subRunning.map((a) => (
+        <Box key={a.id}>
+          <Text color={view.kind === "sub" && view.id === a.id ? theme.prompt : theme.amber}>
+            {`↳ ${a.id}[${a.role}] · t${a.turns} · ${a.elapsedSec}s · 点击查看${a.status === "running" ? "/插话" : ""}`}
+          </Text>
         </Box>
-      )}
+      ))}
     </Box>
   );
 }

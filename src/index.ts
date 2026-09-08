@@ -98,6 +98,7 @@ async function main(): Promise<void> {
       notice: () => {},
       status: () => {},
       subagent: () => {},
+      subagentEvent: () => {},
       resume: () => {},
       convergentEvent: () => {},
       requestResume: (m) => {
@@ -115,7 +116,8 @@ async function main(): Promise<void> {
       confirm: (t, a) => bridge.confirm(t, a),
       onNotice: (s) => bridge.notice(s),
       onStatus: (s) => bridge.status(s),
-      onSubStatus: (s) => bridge.subagent(s),
+      onSubStatus: () => bridge.subagent(),
+      onSubAgentEvent: (id, e) => bridge.subagentEvent(id, e),
       onResume: (t) => bridge.resume(t),
       onConvergentEvent: (e) => bridge.convergentEvent(e),
     });

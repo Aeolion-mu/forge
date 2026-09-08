@@ -15,6 +15,8 @@ export const SUBAGENT_LOG_CAP = 12;
 export interface SubAgentTask {
   id: string;
   role: string;
+  /** 指派的任务原文（供 TUI transcript 的首条 user block）。 */
+  task: string;
   status: "running" | "done" | "cancelled" | "failed";
   turns: number;
   tools: number;
@@ -46,8 +48,8 @@ export interface SubAgentRegistryDeps {
   runLoop: SubAgentRunLoop;
   /** 完成（done / failed，非 cancelled）时把结论作为新一轮喂回主 agent。 */
   onResume?: (text: string) => void;
-  /** running 集合变化时的聚合状态行；无 running 时传 null。 */
-  onStatus?: (msg: string | null) => void;
+  /** 任何状态/进度变化（spawn / turn / 工具 / 插话 / 结束）时 ping 一次；UI 据此重读 list()。 */
+  onUpdate?: () => void;
   /** 失败时记审计（role + 错误信息）。 */
   onError?: (role: string, message: string) => void;
   /** 取当前时刻（注入便于测 elapsed）。默认 Date.now。 */
@@ -68,7 +70,7 @@ export class SubAgentRegistry {
     const id = `s${++this.seq}`;
     const ac = new AbortController();
     const rec: SubAgentTask = {
-      id, role, status: "running", turns: 0, tools: 0, ac,
+      id, role, task, status: "running", turns: 0, tools: 0, ac,
       done: Promise.resolve(), startedAt: this.now(), endedAt: 0, log: [],
     };
     rec.done = (async () => {
@@ -140,20 +142,14 @@ export class SubAgentRegistry {
   /** 列出所有子 agent 的状态快照（供 subagent_list / TUI）。 */
   list(): SubAgentInfo[] {
     return [...this.tasks.values()].map((r) => ({
-      id: r.id, role: r.role, status: r.status, turns: r.turns, tools: r.tools,
+      id: r.id, role: r.role, task: r.task, status: r.status, turns: r.turns, tools: r.tools,
       elapsedSec: this.elapsedSec(r), recentLog: r.log.slice(-3),
     }));
   }
 
-  /** 聚合 running 的子 agent 成一行状态（含已运行秒数）；无 running 时通知 null。 */
+  /** 状态/进度变化的总 ping：UI 收到后重读 list() 自行决定画什么（无 running 自然全部消失）。 */
   refresh(): void {
-    const running = [...this.tasks.values()].filter((r) => r.status === "running");
-    if (!running.length) {
-      this.deps.onStatus?.(null);
-      return;
-    }
-    const parts = running.map((r) => `${r.id}[${r.role}] t${r.turns} ${this.elapsedSec(r)}s`);
-    this.deps.onStatus?.(`↳ ${running.length} subagent(s) · ${parts.join(" · ")}`);
+    this.deps.onUpdate?.();
   }
 
   /** 撤销所有仍在运行的子 agent（供 abort / dispose）。 */

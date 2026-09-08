@@ -13,6 +13,8 @@ export interface SubAgentResult {
 export interface SubAgentInfo {
   id: string;
   role: string;
+  /** 指派的任务原文（供 TUI transcript 的首条 user block）。 */
+  task: string;
   status: "running" | "done" | "cancelled" | "failed";
   turns: number;
   tools: number;

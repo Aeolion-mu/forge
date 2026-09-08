@@ -111,8 +111,8 @@ export function resetBlockCache(): void {
   cache.clear();
 }
 
-export function renderLines(b: Block, width: number): string[] {
-  const key = `${generation}:${b.id}:${width}:${b.kind === "tool" ? (b.collapsed ? "c" : "e") : ""}`;
+export function renderLines(b: Block, width: number, ns = "main"): string[] {
+  const key = `${generation}:${ns}:${b.id}:${width}:${b.kind === "tool" ? (b.collapsed ? "c" : "e") : ""}`;
   let lines = cache.get(key);
   if (!lines) {
     lines = renderBlockLines(b, width);
@@ -121,12 +121,13 @@ export function renderLines(b: Block, width: number): string[] {
   return lines;
 }
 
-/** 展开全部 block → 行数组 + 每行的 blockId 映射（鼠标命中测试用）。 */
-export function flattenBlocks(blocks: Block[], width: number): { lines: string[]; owner: number[] } {
+/** 展开全部 block → 行数组 + 每行的 blockId 映射（鼠标命中测试用）。
+ *  ns = 命名空间（主转录 "main" / 各子 agent "sub:<id>"）：各上下文 block id 独立计数，靠 ns 隔离缓存键。 */
+export function flattenBlocks(blocks: Block[], width: number, ns = "main"): { lines: string[]; owner: number[] } {
   const lines: string[] = [];
   const owner: number[] = [];
   for (const b of blocks) {
-    for (const l of renderLines(b, width)) {
+    for (const l of renderLines(b, width, ns)) {
       lines.push(l);
       owner.push(b.id);
     }

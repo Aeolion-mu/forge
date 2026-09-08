@@ -15,6 +15,7 @@ export const COMMANDS: SlashCommand[] = [
   { name: "/stats", desc: "Show session metrics" },
   { name: "/pass-permissions", desc: "Bypass write/exec confirms (ON by default; --confirm to re-enable)" },
   { name: "/mouse", desc: "Mouse capture on/off (off = native text selection; PgUp/PgDn still scroll)" },
+  { name: "/agents", desc: "List subagents · /agents <id> opens its context (Esc back; input steers it)" },
   { name: "/resume", desc: "Restore a previous session (byte-exact transcript replay)" },
   { name: "/rewind", desc: "Rewind to an earlier message to re-edit it (drops what follows)" },
   { name: "/exit", desc: "Exit Forge" },

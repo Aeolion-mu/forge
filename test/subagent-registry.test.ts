@@ -134,29 +134,35 @@ test("list 快照：状态 / 轮数 / 工具数 / 已运行秒数 / 最近 3 条
   assert.equal(reg.list()[0].elapsedSec, 7);
 });
 
-test("onStatus：有 running 时聚合成一行，全部结束后归零(null)", async () => {
+test("onUpdate：任何状态/进度变化都 ping；UI 靠重读 list() 自行渲染", async () => {
   let clock = 0;
-  const statuses: (string | null)[] = [];
+  let pings = 0;
   const d1 = deferred<SubAgentResult>();
   const d2 = deferred<SubAgentResult>();
   const queue = [d1.promise, d2.promise];
   const reg = new SubAgentRegistry({
     runLoop: () => queue.shift()!,
-    onStatus: (m) => statuses.push(m),
+    onUpdate: () => (pings += 1),
     now: () => clock,
   });
-  reg.spawn("a", "t1", undefined);
-  reg.spawn("b", "t2", undefined);
-
-  const lastRunning = statuses[statuses.length - 1];
-  assert.match(String(lastRunning), /↳ 2 subagent\(s\)/);
-  assert.match(String(lastRunning), /s1\[a\]/);
-  assert.match(String(lastRunning), /s2\[b\]/);
+  const pingsAfterSpawn = (() => {
+    reg.spawn("a", "t1", undefined);
+    reg.spawn("b", "t2", undefined);
+    return pings;
+  })();
+  assert.equal(pingsAfterSpawn, 2); // 每次 spawn 各 ping 一次
+  assert.deepEqual(
+    reg.list().map((x) => `${x.id}[${x.role}] ${x.status}`),
+    ["s1[a] running", "s2[b] running"],
+  );
+  // task 原文进快照（供 TUI transcript 的首条 user block）
+  assert.equal(reg.list()[0].task, "t1");
 
   d1.resolve(ok());
   d2.resolve(ok());
   await flush();
-  assert.equal(statuses[statuses.length - 1], null); // 全结束 → null
+  assert.ok(pings > pingsAfterSpawn); // 结束也 ping（UI 重读后 running 清空 → 状态行消失）
+  assert.deepEqual(reg.list().map((x) => x.status), ["done", "done"]);
 });
 
 test("abortAllRunning：只 abort 仍在 running 的，已结束的不再翻状态", async () => {

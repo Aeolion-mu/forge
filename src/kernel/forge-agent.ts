@@ -131,10 +131,12 @@ export interface ForgeAgentOptions {
   onNotice?: (msg: string) => void;
   /** 长操作（压缩）的实时状态回调：msg 显示「正在干什么」，null 表示结束。Ink 模式下驱动进度行。 */
   onStatus?: (msg: string | null) => void;
-  /** 子 agent 实时状态回调：挂在仪表盘下方显示子 agent 在干什么；null 表示结束。 */
-  onSubStatus?: (msg: string | null) => void;
+  /** 子 agent 注册表有任何状态/进度变化时 ping（无参；UI 重读 listSubAgents 自行渲染）。 */
+  onSubStatus?: () => void;
   /** 后台子 agent 完成时，把结论作为新一轮喂回主 agent（不阻塞主循环）。 */
   onResume?: (text: string) => void;
+  /** 后台子 agent 的事件流（id + 事件）：TUI 据此维护每个子 agent 的实时 transcript，供上下文切换查看。 */
+  onSubAgentEvent?: (id: string, e: HarnessEvent) => void;
   /** Convergent 验收 agent 的事件流：让它的活动像主 agent 一样实时显示（UI 加前缀区分）。 */
   onConvergentEvent?: (e: HarnessEvent) => void;
 }
@@ -316,7 +318,7 @@ export class ForgeAgent {
     this.subagents = new SubAgentRegistry({
       runLoop: (role, task, maxTurns, signal, rec) => this.runSubAgentLoop(role, task, maxTurns, signal, rec),
       onResume: (text) => this.opts.onResume?.(text),
-      onStatus: (msg) => this.subStatus(msg),
+      onUpdate: () => this.subStatus(),
       onError: (role, message) => this.audit.write({ kind: "tool_end", tool: "spawn_subagent", isError: true, preview: `[${role}] ${message}` }),
     });
 
@@ -766,6 +768,7 @@ export class ForgeAgent {
       onSteerReady: (fn) => {
         rec.steer = fn; // 注册插话通道，供 Registry.steer（主 agent 工具 / TUI 用户输入）
       },
+      onEvent: (e) => this.opts.onSubAgentEvent?.(rec.id, e), // 转发全量事件：TUI 维护子 agent transcript
       onTurn: (turns) => {
         rec.turns = turns;
         pushLog(`✓ turn ${turns}`);
@@ -1082,9 +1085,9 @@ export class ForgeAgent {
     this.opts.onStatus?.(msg);
   }
 
-  /** 子 agent 实时状态：挂仪表盘下方。 */
-  private subStatus(msg: string | null): void {
-    this.opts.onSubStatus?.(msg);
+  /** 子 agent 注册表变化 ping：转发给 UI 重读 listSubAgents。 */
+  private subStatus(): void {
+    this.opts.onSubStatus?.();
   }
 
   /** 配置文件里可切换的模型清单。 */
