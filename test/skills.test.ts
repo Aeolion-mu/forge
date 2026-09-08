@@ -398,6 +398,11 @@ test("validateConfigFile：skills 段未知字段/类型错误/枚举错误报�
   assert.throws(() => validateConfigFile({ skills: { dirs: [""] } }), /skills\.dirs 应为/);
 });
 
+test("validateConfigFile：$ 前缀注释键放行（$comment 约定，不算未知字段）", () => {
+  const c = validateConfigFile({ skills: { $comment: "激活哪些芯片", targets: ["ascend"] } });
+  assert.deepEqual(c.skills?.targets, ["ascend"]);
+});
+
 // ---------------------------------------------------------------------------
 // P3：仓库真实 skills/ 目录扫描（common/delta/targets/vendors-lock 全链路）
 // ---------------------------------------------------------------------------

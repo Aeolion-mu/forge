@@ -358,7 +358,8 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
     } else {
       const s = o.skills as Record<string, unknown>;
       const KNOWN_SKILLS_FIELDS = new Set(["builtin", "targets", "dirs", "compat", "indexBudgetTokens", "overrides"]);
-      const unknown = Object.keys(s).filter((k) => !KNOWN_SKILLS_FIELDS.has(k));
+      // `$` 前缀键是本配置文件的注释约定（顶层 $comment/$subagentNote 同款）——放行，不算未知字段。
+      const unknown = Object.keys(s).filter((k) => !KNOWN_SKILLS_FIELDS.has(k) && !k.startsWith("$"));
       if (unknown.length) issues.push(`skills：未知字段 ${unknown.join(", ")}`);
       if (s.builtin !== undefined && typeof s.builtin !== "boolean") issues.push("skills.builtin 应为布尔值");
       if (s.compat !== undefined && typeof s.compat !== "boolean") issues.push("skills.compat 应为布尔值");
