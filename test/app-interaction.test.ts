@@ -362,3 +362,35 @@ test("App 交互：/resume 恢复后 ↑/↓ 能召回历史会话中的用户�
     h.unmount();
   }
 });
+
+test("App 交互：模型信息行可拖选/双击选中复制，复制提示与模型信息同一行", async () => {
+  resetBlockCache();
+  const h = mountApp();
+  try {
+    await h.flush();
+    // 空闲布局：chrome = 输入框(3 行) + 仪表盘(1 行) → 仪表盘在最后一行（ROWS-1）。
+    const dashLineOf = (frame: string) => frame.split("\n").find((l) => l.includes("▌ main")) ?? "";
+    assert.ok(dashLineOf(h.frame()), "仪表盘行应存在");
+    assert.ok(!dashLineOf(h.frame()).includes("已复制"), "初始无复制提示");
+
+    // 拖选仪表盘行的模型名一段 → 松开即复制 → toast 出现在同一行右端
+    h.write(mouse.press(3, ROWS - 1) + mouse.motion(8, ROWS - 1) + mouse.release(8, ROWS - 1));
+    await h.flush();
+    const f1 = h.frame();
+    const d1 = dashLineOf(f1);
+    assert.ok(d1.includes("▌ main"), `仪表盘行仍在：\n${f1}`);
+    assert.ok(d1.includes("已复制"), `复制提示应与模型信息同一行：\n${f1}`);
+
+    // 双击模型名 → 选词复制（同格两次 <500ms）
+    h.write(mouse.press(4, ROWS - 1) + mouse.release(4, ROWS - 1));
+    await h.flush();
+    h.write(mouse.press(4, ROWS - 1) + mouse.release(4, ROWS - 1));
+    await h.flush();
+    assert.ok(dashLineOf(h.frame()).includes("已复制"), "双击选词也应复制并提示");
+
+    // 布局未变：复制提示不单独占行（帧内仍只有一行以 ▌ 开头且总数稳定）
+    assert.equal(h.frame().split("\n").filter((l) => l.trim().startsWith("▌")).length, 1, "子用量行未运行不出现");
+  } finally {
+    h.unmount();
+  }
+});

@@ -106,6 +106,8 @@ export interface AppBridge {
  * 触发全部 block 按新宽度重排（旧追加式 TUI 的「宽度冻死 + 擦除错位」问题根治）。
  * 鼠标：滚轮滚动（上滚暂停自动跟随 + 底部 Jump 按钮计数新消息）、点击折叠的工具结果
  * 展开/再折叠、点击菜单项选中、点击输入框定位光标。
+ * 选择：视口与 chrome 信息行（模型信息 / 子 agent 状态行等）同一套拖选/双击选词/
+ * 三击选行管线（松开即复制，Ctrl+C 手动复制）；输入框内容为字符级拖选（打字替换选中段）。
  */
 export function App({
   agent,
@@ -543,7 +545,7 @@ export function App({
       }
       if (key.shift && (key.leftArrow || key.rightArrow)) {
         if (!cur) return;
-        const lines = flatRef.current.lines;
+        const lines = screenRef.current.lines; // 视口行 + chrome 文本行（选区可跨两者）
         let { line, col } = cur.active;
         if (key.leftArrow) {
           if (col > 0) col -= 1;
@@ -870,35 +872,72 @@ export function App({
     return () => clearInterval(id);
   }, [anySubRunning]);
 
-  // chrome（视口之下的固定区）各段行数，自上而下：
+  // ── chrome 文本行模型 ───────────────────────────────────────────────────────
+  // 视口上下的静态信息行统一转成 ANSI 文本行（aLines 在输入框上方、bLines 子视图头、
+  // cLines 在输入框下方），与视口共用同一套拖选/双击选词/三击选行/复制管线——
+  // 模型信息行等整个底部区域不再是无选择的死区。菜单/选择器/输入框本体仍是 JSX 交互区。
   const reasoningLines =
     busy && thinkRef.current && !bufRef.current
       ? wrapVisible(thinkRef.current.trim(), width - 4).split("\n").slice(-8)
       : [];
-  const jumpLine = scrollOffset > 0 ? 1 : 0;
   const menuLines = menuOpen && !confirm ? menuMatches.length + 1 : 0;
   const pickerLines = picker ? picker.items.length + 1 : 0;
   // 输入框内容行数（多行输入时随之增高；超长行的终端折行不计——点击列映射按逻辑行近似）。
   const inputLines = inputLineCount(input);
   // 子 agent 用量行与状态行只在「有 running」时出现——全部结束后随状态行一起消失。
   const subDashLines = agent.subTelemetry.turns > 0 && anySubRunning ? 1 : 0;
-  const subRowLines = subRunning.length;
-  const subHeaderLine = view.kind === "sub" ? 1 : 0;
-  const toastLine = toast ? 1 : 0;
+
+  const aLines: string[] = [];
+  if (scrollOffset > 0) aLines.push(ansi.amber(`↺ ${newCount > 0 ? `${newCount} new · ` : ""}Jump to bottom（点击 / 滚到底 / Ctrl+End）`));
+  if (reasoningLines.length) {
+    aLines.push(ansi.dim(`${frame} Reasoning`));
+    aLines.push(...reasoningLines.map((l) => ansi.dim(`  ${l}`)));
+  }
+  if (busy) aLines.push(ansi.dim(`${frame} Thinking (${secs}s${estTok > 0 ? ` · ~${estTok} tokens` : ""})`));
+  if (working) aLines.push(ansi.amber(`↻ ${working}`) + ansi.dim(` (${wsecs}s)`));
+
+  const bLines: string[] =
+    view.kind === "sub"
+      ? [
+          ansi.bold("‹ Esc / 点击返回主上下文") +
+            ansi.dim(
+              ` · ${view.id}[${subViewInfo?.role ?? "?"}] ${subViewInfo?.status ?? "未知"} · t${subViewInfo?.turns ?? 0} · ${
+                subViewInfo?.status === "running" ? "输入=对该子 agent 插话" : "已结束（输入不可插话）"
+              }`,
+            ),
+        ]
+      : [];
+
+  // 仪表盘行：模型/上下文/成本信息 + 复制提示（toast）右对齐在同一行——不再单独占一行。
+  const dashLeft =
+    ansi.dim(
+      `▌ ${model} · ctx ${human(dash.ctxUsed)}/${human(win)} (${pct}%) · ${dash.turns} turns · ↑${human(dash.inTok)} ↓${human(dash.outTok)} tok · cache ${Math.round(dash.cacheHit * 100)}% · ¥${dash.cost.toFixed(4)}`,
+    ) +
+    (bypass ? ansi.error(" · bypass") : "") +
+    (sb.backend === "none" ? (sb.enabled ? ansi.amber(" · ⚠ 未沙箱") : "") : ansi.dim(` · ${sb.backend}`));
+  let dashLine = dashLeft;
+  if (toast) {
+    // 右对齐并入仪表盘行；剩余宽度不足就截断/放弃（防折行破坏单行布局假设）。
+    const room = width - visibleWidth(plainOf(dashLeft)) - 2;
+    const t = room < 12 ? null : room < toast.length + 1 ? `${toast.slice(0, room - 2)}…` : toast;
+    if (t) dashLine += " ".repeat(Math.max(1, room - t.length)) + ansi.amber(t);
+  }
+  const cLines: string[] = [dashLine];
+  if (agent.subTelemetry.turns > 0 && anySubRunning) {
+    cLines.push(ansi.dim(`▌ ${agent.subTelemetry.model || "subagent"} · ${agent.subTelemetry.turns} turns · ↑${human(agent.subTelemetry.inputTokens)} ↓${human(agent.subTelemetry.outputTokens)} tok · ¥${agent.subTelemetry.costRmb.toFixed(4)}`));
+  }
+  for (const a of subRunning) {
+    cLines.push(view.kind === "sub" && view.id === a.id ? `↳ ${a.id}[${a.role}] · t${a.turns} · ${a.elapsedSec}s · 点击查看/插话` : ansi.amber(`↳ ${a.id}[${a.role}] · t${a.turns} · ${a.elapsedSec}s · 点击查看/插话`));
+  }
+
   const chromeHeight =
-    toastLine +
-    jumpLine +
-    reasoningLines.length +
-    (busy ? 1 : 0) +
-    (working ? 1 : 0) +
+    aLines.length +
     menuLines +
     pickerLines +
-    subHeaderLine +
+    bLines.length +
     2 + // 输入框上下边框
     inputLines + // 输入内容行（多行输入随之增高）
-    1 + // 仪表盘
-    subDashLines +
-    subRowLines;
+    cLines.length;
   // 视口高度 = 终端行数 − chrome − 1 安全行：帧高恰好顶满终端时，写最后一行会引发
   // 屏幕上滚一格 → 整帧错位级联（实测 PTY 里字符逐行炸开）。留 1 行余量根治。
   const viewportHeight = Math.max(0, termRows - chromeHeight - 1);
@@ -922,9 +961,23 @@ export function App({
   const viewportHeightRef = useRef(viewportHeight);
   viewportHeightRef.current = viewportHeight;
 
-  // 可见行 → blockId 映射 + chrome 各可点区行号（屏幕 1-based 行）——每次渲染后更新供鼠标命中
-  const zonesRef = useRef<{ viewportRows: number; jumpRow: number | null; menuTop: number | null; pickerTop: number | null; inputRow: number | null; subHeaderRow: number | null; subTop: number | null }>({
+  // 可见行 → blockId 映射 + chrome 各可点区行号（屏幕 1-based 行）——每次渲染后更新供鼠标命中。
+  // textRanges：chrome 文本段的行号映射（段首屏幕行 + 行数 + 段在 chrome 文本数组中的基址），
+  // 供「屏幕行 → 全局行号（视口行数 + chrome 基址 + 段内偏移）」的拖选命中换算。
+  const zonesRef = useRef<{
+    viewportRows: number;
+    flatLen: number;
+    textRanges: Array<{ top: number; lines: number; base: number }>;
+    jumpRow: number | null;
+    menuTop: number | null;
+    pickerTop: number | null;
+    inputRow: number | null;
+    subHeaderRow: number | null;
+    subTop: number | null;
+  }>({
     viewportRows: 0,
+    flatLen: 0,
+    textRanges: [],
     jumpRow: null,
     menuTop: null,
     pickerTop: null,
@@ -933,14 +986,23 @@ export function App({
     subTop: null,
   });
   zonesRef.current = (() => {
-    let row = viewportHeight; // 视口占 1..viewportHeight
-    const z = { viewportRows: viewportHeight, jumpRow: null as number | null, menuTop: null as number | null, pickerTop: null as number | null, inputRow: null as number | null, subHeaderRow: null as number | null, subTop: null as number | null };
-    row += toastLine;
-    row += jumpLine;
-    if (jumpLine) z.jumpRow = row;
-    row += reasoningLines.length;
-    row += busy ? 1 : 0;
-    row += working ? 1 : 0;
+    let row = viewportHeight; // 视口占 1..viewportHeight（row 为 0-based「下一行」游标）
+    const z = {
+      viewportRows: viewportHeight,
+      flatLen: activeFlat.lines.length,
+      textRanges: [] as Array<{ top: number; lines: number; base: number }>,
+      jumpRow: null as number | null,
+      menuTop: null as number | null,
+      pickerTop: null as number | null,
+      inputRow: null as number | null,
+      subHeaderRow: null as number | null,
+      subTop: null as number | null,
+    };
+    if (aLines.length) {
+      z.textRanges.push({ top: row + 1, lines: aLines.length, base: 0 });
+      if (scrollOffset > 0) z.jumpRow = row + 1; // aLines 首行是 Jump 按钮
+      row += aLines.length;
+    }
     if (menuLines) {
       z.menuTop = row + 1; // 菜单第一项（1-based）
       row += menuLines;
@@ -949,18 +1011,25 @@ export function App({
       z.pickerTop = row + 1;
       row += pickerLines;
     }
-    if (subHeaderLine) {
+    if (bLines.length) {
+      z.textRanges.push({ top: row + 1, lines: bLines.length, base: aLines.length });
       z.subHeaderRow = row + 1; // 子视图头部（点击返回主上下文）
-      row += subHeaderLine;
+      row += bLines.length;
     }
     row += 1; // 输入框上边框
     z.inputRow = row + 1;
     row += inputLines + 1; // 输入内容行（多行）+ 下边框
-    row += 1; // 仪表盘
-    row += subDashLines;
-    if (subRowLines) z.subTop = row + 1; // 第一个子 agent 状态行
+    if (cLines.length) {
+      z.textRanges.push({ top: row + 1, lines: cLines.length, base: aLines.length + bLines.length });
+      // cLines 内部顺序：仪表盘、子用量行（可选）、各 running 子 agent 状态行。
+      if (subRunning.length) z.subTop = row + 1 + 1 + subDashLines; // 跳过仪表盘与子用量行
+      row += cLines.length;
+    }
     return z;
   })();
+  // 屏幕行全量模型（视口行 + chrome 文本行）：选区文本提取/键盘扩展共用。
+  const screenRef = useRef<{ lines: string[] }>({ lines: [] });
+  screenRef.current.lines = [...activeFlat.lines, ...aLines, ...bLines, ...cLines];
 
   // ── 鼠标 ────────────────────────────────────────────────────────────────────
   const toggleToolBlock = useCallback((toolCallIdOrBlockId: number) => {
@@ -970,16 +1039,17 @@ export function App({
     setSel(null); // 折叠切换会让行号重排，选区失效
   }, []);
 
-  /** 复制当前选区（copy-on-select；FORGE_COPY_ON_SELECT=0 关闭自动、只留 Ctrl+C 手动）。 */
+  /** 复制当前选区（copy-on-select；FORGE_COPY_ON_SELECT=0 关闭自动、只留 Ctrl+C 手动）。
+   *  行号空间 = 视口行 + chrome 文本行（模型信息行等也可选）。 */
   const copySelectionNow = useCallback(
     async (anchor: { line: number; col: number }, active: { line: number; col: number }) => {
       if (process.env.FORGE_COPY_ON_SELECT === "0") return;
-      const text = selectedText(flatRef.current.lines, normalizeRange(anchor, active));
+      const text = selectedText(screenRef.current.lines, normalizeRange(anchor, active));
       if (!text.trim()) return;
       const r = await copyText(text);
       setToast(`⧉ 已复制 ${text.length} 字符 → ${r.path}`);
     },
-    [push],
+    [],
   );
 
   /** 复制输入框选区（拖选松开即复制 / Ctrl+C 手动）。 */
@@ -1009,22 +1079,32 @@ export function App({
       if (ev.button !== 0) return; // v1 只处理左键（选择/点击）
       const z = zonesRef.current;
       const inViewport = ev.row >= 1 && ev.row <= z.viewportRows;
-      /** 屏幕行 → 全局行（可带 offset 覆盖：边缘自动滚后按新视口算） */
+      /** 屏幕（视口）行 → 全局行（可带 offset 覆盖：边缘自动滚后按新视口算） */
       const lineUnder = (row: number, offsetOverride?: number) => {
         const v = visible({ total, height: viewportHeightRef.current, offset: offsetOverride ?? scrollOffsetRef.current });
         return v.start + (row - 1);
       };
+      /** chrome 文本行（模型信息 / 子 agent 状态行等）→ 全局行（flatLen + 段基址 + 段内偏移）。 */
+      const chromeLineUnder = (row: number): number | null => {
+        for (const t of z.textRanges) {
+          if (row >= t.top && row < t.top + t.lines) return z.flatLen + t.base + (row - t.top);
+        }
+        return null;
+      };
+      /** 任意屏幕行 → 全局行（视口或 chrome 文本行；JSX 交互区返回 null）。 */
+      const globalLineAt = (row: number): number | null => (inViewport ? lineUnder(row) : chromeLineUnder(row));
       const textCol = (col: number) => Math.max(0, col - 1); // 屏幕 1-based → 行内 0-based 可见列
       // 输入区行命中 + 屏幕坐标 → 输入 value 字符下标（`› ` 前缀 / 多行 / CJK 宽度统一换算）。
       const inInputRows = (row: number) => z.inputRow !== null && row >= z.inputRow && row < z.inputRow + inputLineCount(inputRef.current);
       const charAtInput = (row: number, col: number): number | null => inputCharAtScreen(inputRef.current, z.inputRow ?? row, row, col);
 
-      // ── 按下：记拖拽起点（视口/输入区才可能拖选；先不动作，等松开区分单击/拖拽）──
+      // ── 按下：记拖拽起点（视口/chrome 文本行/输入区可拖选；等松开区分单击/拖拽）──
       if (ev.kind === "press") {
-        dragRef.current = inViewport
-          ? { startRow: ev.row, startLine: lineUnder(ev.row), startCol: textCol(ev.col), moved: false }
+        const gl = globalLineAt(ev.row);
+        dragRef.current = gl !== null
+          ? { startRow: ev.row, startLine: gl, startCol: textCol(ev.col), moved: false }
           : null;
-        inputDragRef.current = !inViewport && inInputRows(ev.row)
+        inputDragRef.current = gl === null && !inViewport && inInputRows(ev.row)
           ? { startChar: charAtInput(ev.row, ev.col) ?? 0, moved: false }
           : null;
         return;
@@ -1047,15 +1127,19 @@ export function App({
         if (!d.moved && (ev.row !== d.startRow || ev.col !== d.startCol)) d.moved = true;
         if (!d.moved) return;
         let offset = scrollOffsetRef.current;
-        if (ev.row <= 1) {
-          offset = scrollBy({ total, height: viewportHeightRef.current, offset }, 1);
-          setScrollOffset(offset);
-        } else if (ev.row >= z.viewportRows) {
-          offset = scrollBy({ total, height: viewportHeightRef.current, offset }, -1);
-          if (offset === 0) setNewCount(0);
-          setScrollOffset(offset);
+        // 边缘自动滚只对「视口拖选」有意义（chrome 拖选不动视口）。
+        if (d.startLine < total) {
+          if (ev.row <= 1) {
+            offset = scrollBy({ total, height: viewportHeightRef.current, offset }, 1);
+            setScrollOffset(offset);
+          } else if (ev.row >= z.viewportRows) {
+            offset = scrollBy({ total, height: viewportHeightRef.current, offset }, -1);
+            if (offset === 0) setNewCount(0);
+            setScrollOffset(offset);
+          }
         }
-        setSel({ anchor: { line: d.startLine, col: d.startCol }, active: { line: lineUnder(ev.row, offset), col: textCol(ev.col) } });
+        const activeLine = inViewport ? lineUnder(ev.row, offset) : (chromeLineUnder(ev.row) ?? d.startLine);
+        setSel({ anchor: { line: d.startLine, col: d.startCol }, active: { line: activeLine, col: textCol(ev.col) } });
         return;
       }
 
@@ -1068,7 +1152,7 @@ export function App({
         if (d?.moved) {
           // 拖拽结束：定格选区 + 松开即复制
           const anchor = { line: d.startLine, col: d.startCol };
-          const active = { line: lineUnder(ev.row), col: textCol(ev.col) };
+          const active = { line: inViewport ? lineUnder(ev.row) : (chromeLineUnder(ev.row) ?? d.startLine), col: textCol(ev.col) };
           setSel({ anchor, active });
           void copySelectionNow(anchor, active);
           return;
@@ -1080,19 +1164,19 @@ export function App({
           void copyInputSelectionNow(idr.startChar, ch);
           return;
         }
-        // 单击：先双击/三击判定（同格 <500ms）——二击选词、三击选行，选中即复制
+        // 单击：先双击/三击判定（同格 <500ms）——二击选词、三击选行，选中即复制（视口与 chrome 文本行同权）
         const lc = lastClickRef.current;
         const same = lc.row === ev.row && lc.col === ev.col && Date.now() - lc.ts < 500;
         const count = same ? lc.count + 1 : 1;
         lastClickRef.current = { ts: Date.now(), row: ev.row, col: ev.col, count: count >= 3 ? 0 : count };
-        if (inViewport) {
-          const lineIdx = lineUnder(ev.row);
-          const lineText = flatRef.current.lines[lineIdx];
-          if (lineText !== undefined && count >= 2) {
+        {
+          const gl = globalLineAt(ev.row);
+          const lineText = gl !== null ? screenRef.current.lines[gl] : undefined;
+          if (gl !== null && lineText !== undefined && count >= 2) {
             const plain = plainOf(lineText);
             const [c0, c1] = count === 2 ? expandWord(plain, textCol(ev.col)) : wholeLine(plain);
-            const anchor = { line: lineIdx, col: c0 };
-            const active = { line: lineIdx, col: c1 };
+            const anchor = { line: gl, col: c0 };
+            const active = { line: gl, col: c1 };
             setSel({ anchor, active });
             void copySelectionNow(anchor, active);
             return;
@@ -1162,6 +1246,15 @@ export function App({
       return rng ? highlightRange(l, rng[0], rng[1]) : l;
     })
     .join("\n");
+  /** chrome 文本行按全局行号套选区高亮（与视口 viewportText 同一管线；base = 段首全局行号）。 */
+  const hlLines = (lines: string[], base: number) =>
+    lines
+      .map((l, i) => {
+        if (!selRange) return l;
+        const rng = lineRangeInSel(selRange, base + i);
+        return rng ? highlightRange(l, rng[0], rng[1]) : l;
+      })
+      .join("\n");
 
   return (
     <Box flexDirection="column">
@@ -1169,45 +1262,8 @@ export function App({
         <Text>{viewportText}</Text>
       </Box>
 
-      {toast && (
-        <Box justifyContent="flex-end">
-          <Text color={theme.muted}>{toast}</Text>
-        </Box>
-      )}
-
-      {scrollOffset > 0 && (
-        <Box>
-          <Text color={theme.amber}>
-            {`↺ ${newCount > 0 ? `${newCount} new · ` : ""}Jump to bottom（点击 / 滚到底 / Ctrl+End）`}
-          </Text>
-        </Box>
-      )}
-
-      {reasoningLines.length > 0 && (
-        <Box flexDirection="column">
-          <Text color={theme.muted}>{`${frame} Reasoning`}</Text>
-          {reasoningLines.map((l, i) => (
-            <Text key={i} color={theme.muted}>
-              {`  ${l}`}
-            </Text>
-          ))}
-        </Box>
-      )}
-
-      {busy && (
-        <Box>
-          <Text color={theme.muted}>
-            {`${frame} Thinking (${secs}s${estTok > 0 ? ` · ~${estTok} tokens` : ""})`}
-          </Text>
-        </Box>
-      )}
-
-      {working && (
-        <Box>
-          <Text color={theme.amber}>{`↻ ${working}`}</Text>
-          <Text color={theme.muted}>{` (${wsecs}s)`}</Text>
-        </Box>
-      )}
+      {/* chrome 文本段（可选中的信息行）：拖选/双击选词与视口同一套管线。 */}
+      {aLines.length > 0 && <Text>{hlLines(aLines, activeFlat.lines.length + 0)}</Text>}
 
       {menuOpen && !confirm && (
         <Box flexDirection="column">
@@ -1231,16 +1287,7 @@ export function App({
         </Box>
       )}
 
-      {view.kind === "sub" && (
-        <Box>
-          <Text color={theme.prompt}>‹ Esc / 点击返回主上下文</Text>
-          <Text color={theme.muted}>
-            {` · ${view.id}[${subViewInfo?.role ?? "?"}] ${subViewInfo?.status ?? "未知"} · t${subViewInfo?.turns ?? 0} · ${
-              subViewInfo?.status === "running" ? "输入=对该子 agent 插话" : "已结束（输入不可插话）"
-            }`}
-          </Text>
-        </Box>
-      )}
+      {bLines.length > 0 && <Text>{hlLines(bLines, activeFlat.lines.length + aLines.length)}</Text>}
 
       <Box borderStyle="single" borderColor={theme.muted} borderLeft={false} borderRight={false}>
         {confirm ? (
@@ -1273,35 +1320,8 @@ export function App({
         )}
       </Box>
 
-      <Box>
-        <Text color={theme.muted}>
-          ▌ {model} · ctx {human(dash.ctxUsed)}/{human(win)} ({pct}%) · {dash.turns} turns · ↑{human(dash.inTok)} ↓
-          {human(dash.outTok)} tok · cache {Math.round(dash.cacheHit * 100)}% · ¥{dash.cost.toFixed(4)}
-          {bypass ? <Text color={theme.error}> · bypass</Text> : ""}
-          {sb.backend === "none"
-            ? sb.enabled
-              ? <Text color={theme.amber}> · ⚠ 未沙箱</Text>
-              : ""
-            : ` · ${sb.backend}`}
-        </Text>
-      </Box>
-
-      {agent.subTelemetry.turns > 0 && anySubRunning && (
-        <Box>
-          <Text color={theme.muted}>
-            ▌ {agent.subTelemetry.model || "subagent"} · {agent.subTelemetry.turns} turns · ↑{human(agent.subTelemetry.inputTokens)} ↓
-            {human(agent.subTelemetry.outputTokens)} tok · ¥{agent.subTelemetry.costRmb.toFixed(4)}
-          </Text>
-        </Box>
-      )}
-
-      {subRunning.map((a) => (
-        <Box key={a.id}>
-          <Text color={view.kind === "sub" && view.id === a.id ? theme.prompt : theme.amber}>
-            {`↳ ${a.id}[${a.role}] · t${a.turns} · ${a.elapsedSec}s · 点击查看${a.status === "running" ? "/插话" : ""}`}
-          </Text>
-        </Box>
-      ))}
+      {/* 仪表盘（含右端复制提示）/ 子用量 / 子 agent 状态行：同为可选中文本。 */}
+      <Text>{hlLines(cLines, activeFlat.lines.length + aLines.length + bLines.length)}</Text>
     </Box>
   );
 }
