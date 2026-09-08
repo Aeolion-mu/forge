@@ -74,7 +74,7 @@ interface Harness {
 }
 
 /** 渲染一个 App 实例（假 agent 挂真 SubAgentRegistry）。 */
-function mountApp(): Harness {
+function mountApp(opts: { resumedFrom?: unknown; entries?: unknown[] } = {}): Harness {
   const out = fakeStdout();
   const chunks: string[] = [];
   out.on("data", (c) => chunks.push(String(c)));
@@ -95,7 +95,7 @@ function mountApp(): Harness {
     run: async () => {},
     steer: () => {},
     abort: async () => {},
-    conversationEntries: async () => [],
+    conversationEntries: async () => (opts.entries ?? []) as never,
     userTurns: async () => [],
     rewindTo: async () => {},
     compactNow: async () => {},
@@ -121,7 +121,7 @@ function mountApp(): Harness {
     convergentEvent: () => {},
   };
   const config = { live: true, modelRef: "mock/main", allowReadOutsideWorkdir: false } as unknown as ForgeConfig;
-  const instance = render(createElement(App, { agent, config, bridge, mouseStdin }), {
+  const instance = render(createElement(App, { agent, config, bridge, mouseStdin, resumedFrom: opts.resumedFrom as never }), {
     stdout: out as unknown as NodeJS.WriteStream,
     stdin: mouseStdin as unknown as NodeJS.ReadStream,
     debug: true,
@@ -305,6 +305,59 @@ test("App 交互：输入框 ↑/↓ 翻历史输入记录（含草稿保护）"
     h.write("\x1b[B"); // 翻回最新 → 恢复草稿
     await h.flush();
     assert.ok(inputRow(h.frame()).includes("还没写完的草稿"), `↓ 到底应恢复进入浏览前的草稿：\n${h.frame()}`);
+  } finally {
+    h.unmount();
+  }
+});
+
+test("App 交互：/resume 恢复后 ↑/↓ 能召回历史会话中的用户消息", async () => {
+  resetBlockCache();
+  // 最小会话树：3 条用户消息 + 1 条 assistant（replayBlocks 与历史种子共用这些条目）
+  const userMsg = (id: string, text: string) => ({
+    id,
+    parentId: null,
+    type: "message",
+    message: { role: "user", content: [{ type: "text", text }], timestamp: Date.now() },
+  });
+  const entries = [
+    userMsg("e1", "历史消息一"),
+    userMsg("e2", "历史消息二"),
+    { id: "e3", parentId: null, type: "message", message: { role: "assistant", content: [{ type: "text", text: "好的" }], timestamp: Date.now() } },
+    userMsg("e4", "历史消息三"),
+  ];
+  const h = mountApp({ resumedFrom: { id: "sess-1234567890" }, entries });
+  const inputRow = (frame: string): string => {
+    const m = frame.match(/─+\n(›[^\n]*)\n─+/);
+    return m ? m[1]! : "";
+  };
+  try {
+    await h.flush();
+    // 恢复横幅 + 重放
+    const f0 = h.frame();
+    assert.ok(f0.includes("已恢复会话"), `应显示恢复提示：\n${f0}`);
+    assert.ok(f0.includes("历史消息三"), "重放应包含历史用户消息");
+
+    // ↑ → 召回恢复会话里的最后一条用户消息（无需先在本实例发过任何输入）
+    h.write("\x1b[A");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("历史消息三"), `↑ 应召回会话历史最新一条：\n${h.frame()}`);
+
+    // 再 ↑ → 更早的消息
+    h.write("\x1b[A");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("历史消息二"), "再↑ 应到更早的会话历史");
+
+    // 恢复后新发的消息接在历史之后：发一条新的，↑ 先到它、再↑ 到旧会话历史
+    h.write("\x1b[B\x1b[B"); // ↓↓ 回到空草稿
+    await h.flush();
+    h.write("恢复后的新消息\r");
+    await h.flush();
+    h.write("\x1b[A");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("恢复后的新消息"), "↑ 先到最近发出的一条");
+    h.write("\x1b[A");
+    await h.flush();
+    assert.ok(inputRow(h.frame()).includes("历史消息三"), "再↑ 应衔接上恢复的会话历史");
   } finally {
     h.unmount();
   }

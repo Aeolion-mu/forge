@@ -343,7 +343,23 @@ export function App({
     void (async () => {
       const entries = await agent.conversationEntries();
       for (const b of replayBlocks(entries)) pushBlock(b);
-      if (resumedFrom) pushBlock({ kind: "plain", text: ansi.dim(`⏵ 已恢复会话 ${resumedFrom.id.slice(0, 8)}（${entries.length} 条消息）——继续对话即可`) });
+      if (resumedFrom) {
+        pushBlock({ kind: "plain", text: ansi.dim(`⏵ 已恢复会话 ${resumedFrom.id.slice(0, 8)}（${entries.length} 条消息）——继续对话即可`) });
+        // 种输入历史：会话里已有的用户消息按时间序进 ↑/↓ 历史——否则 resume 后
+        // 重建的 App 历史为空，之前的消息无法用 ↑ 召回（斜杠命令不曾入会话树，天然缺席）。
+        const past: string[] = [];
+        for (const e of entries) {
+          if (e.type !== "message") continue;
+          const msg = e.message as { role?: string; content?: unknown };
+          if (msg.role !== "user") continue;
+          const c = msg.content;
+          const text = typeof c === "string" ? c : Array.isArray(c)
+            ? (c as Array<{ type: string; text?: string }>).filter((x) => x.type === "text").map((x) => x.text ?? "").join("")
+            : "";
+          if (text.trim()) past.push(text);
+        }
+        historyRef.current = past.slice(-500); // 上限防超长会话拖内存
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
