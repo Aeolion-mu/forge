@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { renderBlockLines, renderLines, flattenBlocks, defaultCollapsed, resetBlockCache, type Block } from "../src/ui/blocks.js";
+import { visibleWidth } from "../src/ui/markdown.js";
 
 test("markdown block：按渲染期宽度折行——同一 block 两种宽度产出不同行（resize 重排的证据）", () => {
   const b: Block = { id: 1, kind: "markdown", source: "这是一段比较长的中文内容 ".repeat(12) };
@@ -51,6 +52,21 @@ test("flattenBlocks：行数组与 owner 映射对齐，block 间空行", () => 
   assert.equal(lines.length, owner.length);
   assert.equal(lines.filter((l) => l === "").length, 2, "每 block 一条间隔空行");
   assert.ok(owner.every((id) => id === 10 || id === 11));
+});
+
+test("user 块：整行浅灰背景（含右侧补齐），多行每行都有背景", () => {
+  const b: Block = { id: 1, kind: "user", text: "第一行\n第二行" };
+  const got = renderLines(b, 80);
+  assert.equal(got.length, 2);
+  for (const l of got) {
+    assert.ok(l.includes("\x1b[48;5;237m"), "背景色码应在行内");
+    assert.ok(l.endsWith("\x1b[0m"), "行尾应复位");
+  }
+  assert.ok(got[0]!.includes("›"), "首行带 › 前缀");
+  assert.ok(got[1]!.includes("第二行"), "续行内容在");
+  // 补齐：背景覆盖到内容宽（width 80 → content 77，按可见宽度——中文占 2 列）
+  const widths = got.map((l) => visibleWidth(l));
+  assert.ok(widths.every((w) => w === 77), `补齐后行长应一致为 77：${widths.join(",")}`);
 });
 
 test("resetBlockCache 使旧缓存失效（/rewind 重建后 id 重计不再串号）", () => {

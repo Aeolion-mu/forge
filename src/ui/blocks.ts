@@ -1,4 +1,4 @@
-import { renderMarkdown, wrapVisible } from "./markdown.js";
+import { renderMarkdown, wrapVisible, visibleWidth } from "./markdown.js";
 import { renderFileDiff, type FileDiff } from "./diff.js";
 import { ansi, SPARK_REST } from "./theme.js";
 
@@ -62,8 +62,11 @@ export function renderBlockLines(b: Block, width: number): string[] {
     case "banner":
       return b.lines;
     case "user":
-      // `› ` 槽位 + 2 空格悬挂缩进
-      return wrapVisible(b.text, content - 2).split("\n").map((l, i) => (i === 0 ? `\x1b[97m›\x1b[0m ${l}` : `  ${l}`));
+      // `› ` 槽位 + 2 空格悬挂缩进；整行铺浅灰背景（右侧补齐到内容宽）——用户消息一眼可辨。
+      return wrapVisible(b.text, content - 2).split("\n").map((l, i) => {
+        const body = i === 0 ? `\x1b[97m›\x1b[0m ${l}` : `  ${l}`;
+        return ansi.userBg(body + " ".repeat(Math.max(0, content - visibleWidth(body))));
+      });
     case "markdown": {
       const prefix = b.prefix ?? ansi.assistant("●");
       const md = renderMarkdown(b.source, width).split("\n").map((l, i) => (i === 0 ? `${prefix} ${l}` : `  ${l}`));
