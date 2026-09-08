@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 // 0.85 起 pi-ai 根入口不再导出这些函数；/compat 是官方临时 shim（签名不变）。
 import { getEnvApiKey, getModel } from "@earendil-works/pi-ai/compat";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -131,17 +132,31 @@ const BUILTIN: Required<Pick<ForgeFile, "defaultModel" | "models">> = {
 };
 
 /** 极简 .env 加载器（不引第三方依赖）：把 .env 里的键值灌进 process.env。 */
-function loadDotEnv(): void {
-  const file = resolve(process.cwd(), ".env");
-  if (!existsSync(file)) return;
-  for (const raw of readFileSync(file, "utf8").split("\n")) {
+/** 全局配置目录（机器级兜底：~/.forge；FORGE_GLOBAL_DIR 可覆盖——测试/多套环境用）。 */
+export function globalConfigDir(): string {
+  return process.env.FORGE_GLOBAL_DIR || join(homedir(), ".forge");
+}
+
+/** 解析一段 .env 文本并入 env（已存在的值不覆盖；`#` 注释与无等号行跳过）。导出供单测。 */
+export function applyDotEnvText(text: string, env: NodeJS.ProcessEnv = process.env): void {
+  for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
     const eq = line.indexOf("=");
     if (eq < 0) continue;
     const key = line.slice(0, eq).trim();
     const val = line.slice(eq + 1).trim();
-    if (key && (process.env[key] === undefined || process.env[key] === "")) process.env[key] = val;
+    if (key && (env[key] === undefined || env[key] === "")) env[key] = val;
+  }
+}
+
+// 全局安装（npm link 后在任意目录 `forge`）时，启动目录里往往没有 .env/forge.config.json——
+// 机器级兜底 ~/.forge/（API key、ssh 档案这类「跟着机器走」的配置放这里）。
+// 优先级：启动目录 > ~/.forge/；.env 逐文件叠加且不覆盖已有值 → 先到先得。
+function loadDotEnv(): void {
+  for (const file of [resolve(process.cwd(), ".env"), join(globalConfigDir(), ".env")]) {
+    if (!existsSync(file)) continue;
+    applyDotEnvText(readFileSync(file, "utf8"));
   }
 }
 
@@ -315,7 +330,9 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
 }
 
 function readConfigFile(): ForgeFile {
-  const file = resolve(process.cwd(), "forge.config.json");
+  // 启动目录优先；没有再看机器级 ~/.forge/forge.config.json（ssh 档案/默认模型等）
+  const local = resolve(process.cwd(), "forge.config.json");
+  const file = existsSync(local) ? local : join(globalConfigDir(), "forge.config.json");
   if (!existsSync(file)) return {};
   let parsed: unknown;
   try {

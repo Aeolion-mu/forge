@@ -2,6 +2,7 @@ import { createElement } from "react";
 import { render } from "ink";
 import { stdout } from "node:process";
 import { loadConfig, type ForgeConfig } from "./config.js";
+import { parseCliArgs } from "./cli.js";
 import { ForgeAgent } from "./kernel/forge-agent.js";
 import { App, type AppBridge } from "./ui/app.js";
 import { renderBanner, ansi } from "./ui/theme.js";
@@ -50,13 +51,8 @@ async function main(): Promise<void> {
   }
 
   const args = process.argv.slice(2);
-  // 默认跳过写/执行确认（/pass-permissions 常开）：灾难命令仍有 HARD_DENY 硬拦、
-  // 写边界在沙箱内核层，确认弹窗只剩打断价值。--confirm 可回到逐次确认模式。
-  const autoApprove = !args.includes("--confirm");
-  // --resume <id> 的 id 值不进 prompt（否则会被当一次性任务文本）
-  const resumeIdx = args.indexOf("--resume");
-  const promptSkip = new Set(resumeIdx >= 0 && args[resumeIdx + 1] ? [args[resumeIdx + 1]!] : []);
-  const prompt = args.filter((a, i) => !a.startsWith("-") && i !== resumeIdx + 1 && !promptSkip.has(a)).join(" ").trim();
+  // 参数解析抽纯函数（src/cli.ts，可单测）：--confirm / --resume <id> / 位置参数 = prompt。
+  const { autoApprove, resumeId, prompt } = parseCliArgs(args);
 
   // 1) 一次性任务：forge "把 README 里的 TODO 列出来"（非 TUI，沿用流式渲染器）
   if (prompt) {
@@ -79,11 +75,7 @@ async function main(): Promise<void> {
   const io = new TerminalIo(stdout);
   let resumeMeta: JsonlSessionMetadata | undefined = undefined;
   // --resume <id> / FORGE_RESUME=<id> 直启（id 前缀匹配）
-  const resumeArg = (() => {
-    const i = args.indexOf("--resume");
-    if (i >= 0 && args[i + 1]) return args[i + 1]!;
-    return process.env.FORGE_RESUME;
-  })();
+  const resumeArg = resumeId || process.env.FORGE_RESUME;
   if (resumeArg) {
     const all = await ForgeAgent.listSessions(config);
     const hit = all.find((x) => x.id === resumeArg || x.id.startsWith(resumeArg));

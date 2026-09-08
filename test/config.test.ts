@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateConfigFile } from "../src/config.js";
+import { validateConfigFile, applyDotEnvText, globalConfigDir } from "../src/config.js";
 
 test("合法配置原样通过", () => {
   const c = validateConfigFile({
@@ -126,4 +126,27 @@ test("sandbox 默认策略：writePaths 不含 ~/.config；readDeny 默认盖 ~/
   const writePaths = defaultWritePaths(home);
   assert.ok(!writePaths.includes(`${home}/.config`), "旧默认的 ~/.config 已收紧（显式配置才可写）");
   assert.deepEqual(defaultReadDeny(home), [`${home}/.ssh`, `${home}/.aws`, `${home}/.gnupg`]);
+});
+
+test("applyDotEnvText：解析 KEY=VAL、注释/空行/无等号跳过、已有值不覆盖（cwd 先于全局兜底的机制）", () => {
+  const env: Record<string, string | undefined> = { SHELL_SET: "from-shell" };
+  applyDotEnvText("# 注释\n\nFOO=bar\n SPACED = spaced \nno-eq-line\nSHELL_SET=from-file\nEMPTY=\n", env);
+  assert.equal(env.FOO, "bar");
+  assert.equal(env.SPACED, "spaced");
+  assert.equal(env.SHELL_SET, "from-shell", "已存在的值不被文件覆盖");
+  assert.equal(env.EMPTY, "", "空值也写入（覆盖语义：undefined/空串都算未设）");
+  assert.equal("no-eq-line" in env, false);
+});
+
+test("globalConfigDir：默认 ~/.forge，FORGE_GLOBAL_DIR 可覆盖（全局兜底的定位）", () => {
+  const prev = process.env.FORGE_GLOBAL_DIR;
+  try {
+    delete process.env.FORGE_GLOBAL_DIR;
+    assert.ok(globalConfigDir().endsWith("/.forge"), globalConfigDir());
+    process.env.FORGE_GLOBAL_DIR = "/tmp/forge-test-global";
+    assert.equal(globalConfigDir(), "/tmp/forge-test-global");
+  } finally {
+    if (prev === undefined) delete process.env.FORGE_GLOBAL_DIR;
+    else process.env.FORGE_GLOBAL_DIR = prev;
+  }
 });
