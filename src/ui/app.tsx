@@ -784,6 +784,7 @@ export function App({
         const arg = line.slice("/agents".length).trim();
         if (!arg) {
           const xs = agent.listSubAgents();
+          if (viewRef.current.kind === "sub") setToast("↳ 命令输出在主上下文（Esc 返回查看）");
           push(xs.length ? xs.map((x) => `  ${x.id} [${x.role}] ${x.status} · ${x.turns} 轮 / ${x.tools} 工具 · ${x.elapsedSec}s`).join("\n") + ansi.dim("\n  /agents <id> 查看其上下文（Esc 返回；子视图内输入 = 插话）") : ansi.dim("暂无子 agent——主 agent spawn_subagent 后会出现在底部状态行（可点击查看）。"));
         } else if (agent.listSubAgents().some((x) => x.id === arg)) openSubView(arg);
         else push(ansi.error(`无此子 agent：${arg}（/agents 查看清单）`));
@@ -792,6 +793,7 @@ export function App({
       const handler = slashHandlers[line];
       if (handler) {
         await handler();
+        if (viewRef.current.kind === "sub") setToast("↳ 命令输出在主上下文（Esc 返回查看）");
         return;
       }
       // 子 agent 视图内：普通输入 = 对该子 agent 插话（steer，当前步后送达）

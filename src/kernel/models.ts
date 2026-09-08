@@ -101,3 +101,8 @@ function keylessAuth(name: string) {
 export function resetModels(): void {
   instance = null;
 }
+
+/** 单测用：直接安装预构建的 Models 实例（如进程内 mock provider），绕过内置注册表。 */
+export function setModelsInstance(models: Models): void {
+  instance = models;
+}

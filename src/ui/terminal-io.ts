@@ -151,6 +151,7 @@ export function createMouseStdin(real: Readable): MouseStdin {
   const queue: string[] = [];
   const proxy = new EventEmitter() as unknown as MouseStdin & EventEmitter;
   let carry = "";
+  let carryTimer: NodeJS.Timeout | undefined;
 
   const anyProxy = proxy as unknown as Record<string, unknown>;
   anyProxy.read = (_size?: number) => {
@@ -179,6 +180,20 @@ export function createMouseStdin(real: Readable): MouseStdin {
     if (passthrough) {
       proxy.emit("readable");
     }
+    // 孤立 ESC / 断裂序列残留：真终端按 Esc 只发一个 \x1b 字节，若无限等下去
+    // Esc 键会被永久吞掉（picker 取消、子视图返回全失灵）。短暂等待后续字节
+    // （完整鼠标/方向键序列几乎总在同一 chunk 到达），超时仍不完整 → 当普通输入透传。
+    if (carryTimer) clearTimeout(carryTimer);
+    if (carry) {
+      carryTimer = setTimeout(() => {
+        carryTimer = undefined;
+        if (!carry) return;
+        for (const piece of splitControls(carry)) queue.push(piece);
+        carry = "";
+        proxy.emit("readable");
+      }, 30);
+      carryTimer.unref?.();
+    }
   };
   real.on("data", onData);
   real.resume();
@@ -186,6 +201,7 @@ export function createMouseStdin(real: Readable): MouseStdin {
   // 退出时解除：对真实 stdin 的 data 监听会保持事件循环存活（进程退不干净）。
   anyProxy.detach = () => {
     real.removeListener("data", onData);
+    if (carryTimer) clearTimeout(carryTimer);
     try {
       real.pause();
     } catch {

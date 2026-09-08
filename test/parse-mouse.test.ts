@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseMouseSequence, splitMouseSequences } from "../src/ui/terminal-io.js";
+import { parseMouseSequence, splitMouseSequences, createMouseStdin } from "../src/ui/terminal-io.js";
 
 const ESC = "\x1b";
 
@@ -72,4 +72,29 @@ test("splitMouseSequences：纯文本直通", () => {
   assert.equal(r.passthrough, "hello 世界\n");
   assert.equal(r.events.length, 0);
   assert.equal(r.leftover, "");
+});
+
+test("createMouseStdin：孤立 ESC（真实 Esc 键）超时冲刷透传，不再被永久扣住", async () => {
+  const { PassThrough } = await import("node:stream");
+  const real = new PassThrough();
+  const proxy = createMouseStdin(real);
+  const read: () => string[] = () => {
+    const out: string[] = [];
+    for (;;) {
+      const v = proxy.read() as string | null;
+      if (v === null || v === undefined) break;
+      out.push(v);
+    }
+    return out;
+  };
+  // 方向键（完整序列）立即透传
+  real.write(`${ESC}[A`);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(read(), [`${ESC}[A`]);
+  // 孤立 ESC：30ms 冲刷定时器后作为普通输入出现（此前是永久 leftover —— Esc 键失灵根因）
+  real.write(ESC);
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(read(), [ESC]);
+  // 冲刷计时器不拖住进程退出（unref）
+  (proxy as unknown as { detach?: () => void }).detach?.();
 });

@@ -153,7 +153,7 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 
 **工具集**：`read_file` · `list_dir` · `write_file` · `edit_file` · `apply_patch` · `glob` · `grep` ·
 `outline` · `repo_map` · `definition` · `references` · `hover` · `rename` · `diagnostics` · `bash` ·
-`memory_read` / `memory_write` / `memory_list` · `spawn_subagent` / `subagent_list` / `subagent_cancel`。
+`memory_read` / `memory_write` / `memory_list` · `spawn_subagent` / `subagent_steer` / `subagent_list` / `subagent_cancel`。
 
 ---
 
@@ -168,9 +168,11 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 3. **上下文工程（systemPrompt 注入 + `hooks.before_compaction`）** — 会话开头注入持久记忆索引（`.forge/memory` 项目 + 全局双作用域）；
    超 90% 窗口时接管库的压缩原语，用自研 cut point（对齐 turn 边界、留近端 ~20% 窗口）+ 9 段 coding 向摘要，
    prompt 过长时 **map-reduce 二分兜底**（不盲丢最早历史），连续失败 3 次熔断防空烧 API。
-4. **子 Agent 编排（自定义工具 + 递归 Harness，fire-and-forget）** — `spawn_subagent` 把子任务派给隔离子 Agent：
+4. **子 Agent 编排（自定义工具 + 递归 Harness，fire-and-forget + 双向 steering）** — `spawn_subagent` 把子任务派给隔离子 Agent：
    **立即返回 id、后台异步跑、不阻塞主 Agent**；子 Agent 跑独立会话、用更省的 flash 模型、受限只读工具集、不持有 spawn 工具（防递归）。
    完成后结论经串行队列自动喂回主 Agent —— 经典 orchestrator-worker。
+   运行期间**主 Agent（`subagent_steer` 工具）与用户（TUI 子 Agent 视图内输入）都可随时插话**——消息在当前工具步执行完、下一次思考前注入，不打断当前步；
+   TUI 底部每个运行中的子 Agent 一行实时状态（轮数/耗时），**点击即进入其上下文**逐条查看它的对话与工具调用（`/agents <id>`、Esc 返回），全部结束后状态行自动消失。
 5. **代码智能（tree-sitter + LSP）** — `outline`/`repo_map` 先看结构再精读；`definition`/`references`/`hover`/`rename` 走 LSP（跨文件、比 grep 准）；
    **编辑后自动诊断**：写类工具成功后对受影响文件跑 LSP，有 error 就追加进工具结果让模型立即看到。
 6. **全链路可观测（`events.on` 全类型扇出）** — 订阅事件流，实时流式渲染 +
