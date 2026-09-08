@@ -26,6 +26,8 @@ export interface SubAgentTask {
   endedAt: number;
   /** 运行日志环形缓冲（turn / 工具调用）。 */
   log: string[];
+  /** 中途插话通道（runLoop 建好子 lane 后回填；把文本注入该子 agent 的当前 run）。 */
+  steer?: (text: string) => void;
 }
 
 /**
@@ -110,6 +112,24 @@ export class SubAgentRegistry {
     if (rec.status !== "running") return `子 agent ${id} 已 ${rec.status}，无需撤销`;
     rec.ac.abort();
     return `已请求撤销子 agent ${id}（${rec.role}）`;
+  }
+
+  /**
+   * 中途插话（steering）：把文本注入运行中的子 agent 当前 run（当前步工具执行完、
+   * 下一次 LLM 调用前送达，不打断当前步）。主 agent（subagent_steer 工具）和
+   * 用户（TUI 子 agent 视图内输入）都走这里。
+   */
+  steer(id: string, text: string): string {
+    const rec = this.tasks.get(id);
+    if (!rec) return `无此子 agent：${id}`;
+    if (rec.status !== "running") return `子 agent ${id} 已 ${rec.status}，无法插话`;
+    if (!rec.steer) return `子 agent ${id} 尚未就绪，稍后再试`;
+    rec.steer(text);
+    const brief = text.replace(/\s+/g, " ").slice(0, 60);
+    rec.log.push(`↳ 插话: ${brief}`);
+    if (rec.log.length > SUBAGENT_LOG_CAP) rec.log.shift();
+    this.refresh();
+    return `已向子 agent ${id}（${rec.role}）插话——当前步完成后送达：${brief}`;
   }
 
   /** 子 agent 已运行 / 总耗时（秒）：running 用当前时刻，已结束用 endedAt。 */

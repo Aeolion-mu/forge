@@ -180,3 +180,35 @@ test("abortAllRunning：只 abort 仍在 running 的，已结束的不再翻状�
   assert.equal(byId.get("s1"), "done"); // 已结束的不受影响
   assert.equal(byId.get("s2"), "cancelled"); // running 的被撤销
 });
+
+test("steer：running 且通道就绪 → 转发文本并写运行日志", async () => {
+  const steered: string[] = [];
+  const d = deferred<SubAgentResult>();
+  const reg = new SubAgentRegistry({
+    runLoop: (_r, _t, _m, _s, rec) => {
+      rec.steer = (text) => steered.push(text); // 模拟 onSteerReady 回填通道
+      return d.promise;
+    },
+  });
+  const id = reg.spawn("researcher", "长任务", undefined);
+
+  const msg = reg.steer(id, "顺便也查一下 Y");
+  assert.match(msg, /已向子 agent s1（researcher）插话/);
+  assert.deepEqual(steered, ["顺便也查一下 Y"]);
+  assert.match(reg.list()[0].recentLog.join("\n"), /插话: 顺便也查一下 Y/);
+
+  d.resolve(ok());
+  await flush();
+});
+
+test("steer：未就绪（通道没回填）/ 已结束 / 未知 id → 可读提示，不抛错", async () => {
+  const d = deferred<SubAgentResult>();
+  const reg = new SubAgentRegistry({ runLoop: (_r, _t, _m, _s, rec) => (rec.steer = undefined, d.promise) });
+  const id = reg.spawn("worker", "干活", undefined);
+  assert.match(reg.steer(id, "hi"), /尚未就绪/); // runLoop 还没回填通道
+
+  d.resolve(ok());
+  await flush();
+  assert.match(reg.steer(id, "hi"), /已 done，无法插话/);
+  assert.match(reg.steer("s99", "hi"), /无此子 agent/);
+});

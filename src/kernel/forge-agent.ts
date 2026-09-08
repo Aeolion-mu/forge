@@ -480,6 +480,7 @@ export class ForgeAgent {
       ...makeMemoryTools(memory),
       ...makeSubAgentTools({
         spawn: (role, task, maxTurns) => self.spawnSubAgent(role, task, maxTurns),
+        steer: (id, message) => self.steerSubAgent(id, message),
         cancel: (id) => self.cancelSubAgent(id),
         list: () => self.listSubAgents(),
       } satisfies SubAgentOrchestrator),
@@ -577,6 +578,13 @@ export class ForgeAgent {
     return this.subagents.spawn(role, task, maxTurns);
   }
 
+  /** 对运行中的子 agent 插话（主 agent 工具与 TUI 用户输入共用）。 */
+  steerSubAgent(id: string, message: string): string {
+    const msg = this.subagents.steer(id, message);
+    this.audit.write({ kind: "prompt", preview: `[subagent-steer ${id}] ${message}` });
+    return msg;
+  }
+
   /** 中途撤销运行中的子 agent。 */
   cancelSubAgent(id: string): string {
     return this.subagents.cancel(id);
@@ -645,6 +653,11 @@ export class ForgeAgent {
     onTurn?: (turns: number) => void;
     /** 每次工具调用开始回调。 */
     onToolStart?: (toolName: string, args: unknown, turns: number, tools: number) => void;
+    /**
+     * 子 lane 就绪后回调，交付 steer 通道（把文本注入该 agent 当前 run，当前步后送达）。
+     * 调用方把它存进任务记录即可随时插话（SubAgentRegistry.steer）。
+     */
+    onSteerReady?: (steer: (text: string) => void) => void;
     /** 飞行记录标签（如 `subagent:foo#3` / `convergent`）；传了且飞行记录开启则把该子 harness 的全量事件也落盘。 */
     flightTag?: string;
   }): Promise<SubAgentResult> {
@@ -666,6 +679,8 @@ export class ForgeAgent {
       ctx,
     );
     const subLane = await sub.lane("main", ctx);
+    // 交付 steer 通道：把文本注入该子 agent 的当前 run（当前步工具执行完、下一次 LLM 调用前送达）。
+    opts.onSteerReady?.((text) => void subLane.steer(text, undefined, ctx));
     if (opts.gate) {
       const gate = opts.gate;
       sub.hooks.on("before_tool", (e) => gate(e.toolName, e.args));
@@ -748,6 +763,9 @@ export class ForgeAgent {
       signal,
       flightTag: `subagent:${role}#${rec.id}`,
       telemetry: this.subTelemetry.handle, // flash 用量计入子 agent 统计
+      onSteerReady: (fn) => {
+        rec.steer = fn; // 注册插话通道，供 Registry.steer（主 agent 工具 / TUI 用户输入）
+      },
       onTurn: (turns) => {
         rec.turns = turns;
         pushLog(`✓ turn ${turns}`);
