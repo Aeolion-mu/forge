@@ -101,24 +101,20 @@ export interface SshProfile {
 /** skills 四态覆盖的合法值（对齐 Claude skillOverrides 语义）。 */
 export type SkillsOverrideState = "on" | "off" | "user-only" | "name-only";
 
-/** forge.config.json 的 skills 段（校验中间态）。 */
+/** forge.config.json 的 skills 段（校验中间态）。rev3：targets/indexBudgetTokens 已移除（全量注册 + 一行摘要）。 */
 export interface SkillsFileConfig {
   builtin?: boolean;
-  targets?: string[];
   dirs?: string[];
   compat?: boolean;
-  indexBudgetTokens?: number;
   overrides?: Record<string, SkillsOverrideState>;
 }
 
 /** 运行时 skills 配置（loadConfig 解析 + env 覆盖后的定型值）。 */
 export interface SkillsRuntimeConfig {
   builtin: boolean;
-  targets: string[];
   /** 额外 skills 根目录（绝对路径，~ 已展开）。 */
   dirs: string[];
   compat: boolean;
-  indexBudgetTokens: number;
   overrides: Record<string, SkillsOverrideState>;
 }
 
@@ -354,23 +350,18 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
 
   if (o.skills !== undefined) {
     if (typeof o.skills !== "object" || o.skills === null || Array.isArray(o.skills)) {
-      issues.push("skills 应为对象（builtin/targets/dirs/compat/indexBudgetTokens/overrides）");
+      issues.push("skills 应为对象（builtin/dirs/compat/overrides）");
     } else {
       const s = o.skills as Record<string, unknown>;
-      const KNOWN_SKILLS_FIELDS = new Set(["builtin", "targets", "dirs", "compat", "indexBudgetTokens", "overrides"]);
+      const KNOWN_SKILLS_FIELDS = new Set(["builtin", "dirs", "compat", "overrides"]);
       // `$` 前缀键是本配置文件的注释约定（顶层 $comment/$subagentNote 同款）——放行，不算未知字段。
       const unknown = Object.keys(s).filter((k) => !KNOWN_SKILLS_FIELDS.has(k) && !k.startsWith("$"));
       if (unknown.length) issues.push(`skills：未知字段 ${unknown.join(", ")}`);
       if (s.builtin !== undefined && typeof s.builtin !== "boolean") issues.push("skills.builtin 应为布尔值");
       if (s.compat !== undefined && typeof s.compat !== "boolean") issues.push("skills.compat 应为布尔值");
-      if (s.indexBudgetTokens !== undefined && !(typeof s.indexBudgetTokens === "number" && Number.isFinite(s.indexBudgetTokens) && s.indexBudgetTokens > 0)) {
-        issues.push("skills.indexBudgetTokens 应为正数（token）");
-      }
-      if (s.targets !== undefined) {
-        if (!Array.isArray(s.targets) || !s.targets.every((t) => typeof t === "string" && /^[a-z0-9][a-z0-9-]*$/.test(t))) {
-          issues.push("skills.targets 应为 [a-z0-9-] 字符串数组（targets/*.yaml 的 target 名）");
-        }
-      }
+      // rev3 移除项给明确报错（而非笼统「未知字段」），指引用户删掉
+      if (s.targets !== undefined) issues.push("skills.targets 已移除（rev3）：skills 现在全量注册、模型用 skill_list/skill_read 按需翻阅——删掉这一行即可");
+      if (s.indexBudgetTokens !== undefined) issues.push("skills.indexBudgetTokens 已移除（rev3）：system prompt 只留一行摘要，无索引预算——删掉这一行即可");
       if (s.dirs !== undefined) {
         if (!Array.isArray(s.dirs) || !s.dirs.every((d) => typeof d === "string" && d.trim())) {
           issues.push("skills.dirs 应为非空字符串数组（额外 skills 根目录）");
@@ -388,10 +379,8 @@ export function validateConfigFile(parsed: unknown, file = "forge.config.json"):
       }
       out.skills = {
         ...(typeof s.builtin === "boolean" ? { builtin: s.builtin } : {}),
-        ...(Array.isArray(s.targets) ? { targets: s.targets as string[] } : {}),
         ...(Array.isArray(s.dirs) ? { dirs: s.dirs as string[] } : {}),
         ...(typeof s.compat === "boolean" ? { compat: s.compat } : {}),
-        ...(typeof s.indexBudgetTokens === "number" ? { indexBudgetTokens: s.indexBudgetTokens } : {}),
         ...(s.overrides && typeof s.overrides === "object" && !Array.isArray(s.overrides) ? { overrides: s.overrides as Record<string, SkillsOverrideState> } : {}),
       };
     }
@@ -493,14 +482,10 @@ export function loadConfig(): ForgeConfig {
     },
     ssh: file.ssh ?? {}, // 仅来自 forge.config.json；非空才注册 ssh_run 工具
     skills: {
-      // env 覆盖：FORGE_SKILLS_BUILTIN=0 / FORGE_SKILLS_COMPAT=1 / FORGE_SKILLS_BUDGET / FORGE_SKILLS_TARGETS(逗号分隔)。
+      // env 覆盖：FORGE_SKILLS_BUILTIN=0 / FORGE_SKILLS_COMPAT=1。rev3：无 targets（全量注册）。
       builtin: process.env.FORGE_SKILLS_BUILTIN === "0" ? false : file.skills?.builtin ?? true,
-      targets: process.env.FORGE_SKILLS_TARGETS
-        ? process.env.FORGE_SKILLS_TARGETS.split(",").map((s) => s.trim()).filter(Boolean)
-        : file.skills?.targets ?? ["common"],
       dirs: expandHomePaths(file.skills?.dirs ?? []),
       compat: process.env.FORGE_SKILLS_COMPAT === "1" ? true : file.skills?.compat ?? false,
-      indexBudgetTokens: Number(process.env.FORGE_SKILLS_BUDGET || file.skills?.indexBudgetTokens || 1500),
       overrides: file.skills?.overrides ?? {},
     },
     sandbox: {

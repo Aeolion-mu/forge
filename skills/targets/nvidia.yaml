@@ -1,8 +1,0 @@
-# NVIDIA：通用层 + 社区高质 skills（MIT）+ 深化差异层。
-name: nvidia
-label: NVIDIA CUDA
-include:
-  - common
-  - vendor:kernelflow-cuda-optimizer
-  - vendor:tensormux-kernel-skills
-  - delta:nvidia

@@ -34,7 +34,7 @@ const HARD_DENY_PATTERNS: { re: RegExp; why: string }[] = [
 
 /** 默认放行的只读工具（无副作用）。code-intel/LSP 查询类均只读；rename 会改文件不在此列。 */
 const READONLY_TOOLS = new Set([
-  "read_file", "list_dir", "glob", "grep", "diagnostics", "memory_read", "memory_list", "skill_read",
+  "read_file", "list_dir", "glob", "grep", "diagnostics", "memory_read", "memory_list", "skill_list", "skill_read",
   "outline", "repo_map", "definition", "references", "hover",
   // 子 agent 控制类（不写文件）：查看/收结果/撤销放行；spawn_subagent 仍需确认（会起进程跑 LLM）
   "subagent_list", "subagent_cancel",

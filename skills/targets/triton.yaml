@@ -1,5 +1,0 @@
-# 纯 Triton（不限后端）：通用层。FlagGems 语料按需在 triton-kernel-basics 内指引。
-name: triton
-label: Triton（跨后端）
-include:
-  - common

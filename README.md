@@ -64,7 +64,7 @@ npx tsx src/index.ts "把 src 下的文件列出来并数一下行数"   # 一�
 /converge           查看当前 /converge 目标与上轮验收结论
 /converge clear     清除当前目标
 /compact            手动触发一次完整压缩（9 段摘要 + Skills used）
-/skills             列出已加载的 skills（来源/target/诊断）
+/skills             列出全部已注册 skills（分区/溯源/诊断）
 /skills <name>      把某条 skill 的正文作为用户消息显式注入
 /stats              打印本次会话的 token / 成本 / 工具调用指标
 /pass-permissions   跳过写/执行类确认（灾难命令仍硬拦）
@@ -145,7 +145,7 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 | `src/kernel/audit.ts` | 结构化审计日志（JSONL） |
 | `src/kernel/compaction.ts` | 上下文压缩纯逻辑：turn 对齐裁剪点 + 9 段摘要模板 + map-reduce 兜底 |
 | `src/kernel/memory.ts` | 多文件记忆：`MEMORY.md` 索引常驻注入，`<name>.md` 按需召回（项目 + 全局双作用域）|
-| `src/kernel/skills.ts` | Skills 管理内核（2026-09）：物理三态 × 逻辑组合——`skills/{common,delta,vendors,targets}`，manifest 声明式组合成芯片视图（详见 `docs/skills-management-plan.md`）；索引快照注入、按需 `skill_read` |
+| `src/kernel/skills.ts` | Skills 管理内核（2026-09，rev3 全量注册）：`skills/{common,delta,vendors}` 扫描归一 + 一行摘要 + `skill_list`/`skill_read` 按需翻阅（详见 `docs/skills-management-plan.md`） |
 | `src/kernel/lsp-client.ts` | 最小 LSP 客户端：pyright / typescript-language-server，跨文件 definition/references/hover/rename/诊断 |
 | `src/kernel/code-outline.ts` | tree-sitter 符号大纲（read_file 之前先看结构，省上下文）|
 | `src/kernel/telemetry.ts` + `pricing.ts` | 可观测：token / 时延 / 工具指标 + 按国产模型真实定价算成本（人民币）|
@@ -155,17 +155,16 @@ Convergent 判 NO → 把具体反馈喂回主 agent 自动再来一轮；判 YE
 
 **工具集**：`read_file` · `list_dir` · `write_file` · `edit_file` · `apply_patch` · `glob` · `grep` ·
 `outline` · `repo_map` · `definition` · `references` · `hover` · `rename` · `diagnostics` · `bash` ·
-`memory_read` / `memory_write` / `memory_list` · `skill_read` · `spawn_subagent` / `subagent_steer` / `subagent_list` / `subagent_cancel`。
+`memory_read` / `memory_write` / `memory_list` · `skill_list` / `skill_read` · `spawn_subagent` / `subagent_steer` / `subagent_list` / `subagent_cancel`。
 
-#### Skills：算子知识的三态组合（2026-09 转型第一步）
+#### Skills：全量注册 + agent 按需翻阅（2026-09 转型第一步，rev3）
 
-forge 正在转型为**算子开发专用** AI 编程工具（昇腾 / Triton / 天数智芯 / 沐曦 / 燧原 / 海光 / NVIDIA / AMD）。skills 机制按「物理三态 × 逻辑组合」组织：
+forge 正在转型为**算子开发专用** AI 编程工具（昇腾 / Triton / 天数智芯 / 沐曦 / 燧原 / 海光 / NVIDIA / AMD）：
 
-- **物理三态**：`skills/common/`（通用层：Triton 基线、优化闭环、bench 方法）+ `skills/delta/<厂商>/`（差异层：只存与家族常识不同之处，如海光 DTK≠ROCm 差异表）+ `skills/vendors/`（上游快照，`skills.lock.json` 锁 repo/ref/license，`npm run skills:fetch` 更新）。
-- **逻辑组合**：`skills/targets/<芯片>.yaml` manifest 声明引用（`common` / `delta:<v>` / `vendor:<n>[/<sub>]` / `target:<t>` 传递组合，如海光 = target:amd + delta:hygon）——不复制、不软链，物理去重让通用知识只注入一次。
-- **上下文纪律**：索引块在会话开始一次渲染成快照（字节级恒定，DeepSeek 前缀缓存安全，默认预算 1500 token）；正文经 `skill_read` 按需加载（工具结果天然 append-only），同一 skill 会话内重复调用只返回短注记。
+- **物理布局**：`skills/common/`（通用层：Triton 基线、优化闭环、bench 方法）+ `skills/delta/<厂商>/`（差异层：只存与家族常识不同之处，如海光 DTK≠ROCm 差异表）+ `skills/vendors/`（上游快照，`skills.lock.json` 锁 repo/ref/license，`npm run skills:fetch` 更新）。同名后读覆盖先读：`common → vendors → delta → 用户层`（厂商特化胜家底，项目层最具体）。
+- **无开关，全量注册**：启动即注册全部分区（无 targets 白名单）；system prompt 只留**一行总量摘要**（各分区计数 + 指路），清单与正文完全不常驻——发现性交给模型自己：`skill_list(partition/filter)` 翻清单、`skill_read(<name>)` 读全文（会话内幂等，重复调用只回短注记）。工具结果天然 append-only，DeepSeek 前缀缓存安全。
 - **格式兼容**：Claude Code 与 Codex 2026 年已共同收敛到 SKILL.md 开放标准——一套解析器通吃（含 `agents/openai.yaml`、Claude 扩展字段的归一识别）。
-- **配置**：`forge.config.json` → `"skills": { "targets": ["hygon","metax"], "overrides": {...} }`；用户层 `.forge/skills`（项目，最高优先级）与 `~/.forge/skills`（全局）同名覆盖内置。
+- **配置**：`forge.config.json` → `"skills": { "overrides": {...四态 } }`（`off` / `user-only` / `name-only`）；用户层 `.forge/skills`（项目，最高优先级）与 `~/.forge/skills`（全局）同名覆盖内置。
 - 厂商调研底稿与素材地图见 `docs/research/`。
 
 ---

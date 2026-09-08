@@ -1,8 +1,0 @@
-# AMD：通用层 + 官方 amd/skills 与 GEAK 专家调优（MIT）+ 差异层。
-name: amd
-label: AMD ROCm/HIP
-include:
-  - common
-  - vendor:amd-skills
-  - vendor:geak
-  - delta:amd

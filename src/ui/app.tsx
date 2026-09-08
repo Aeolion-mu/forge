@@ -764,20 +764,13 @@ export function App({
         push(
           rs
             .map((r) => {
-              const tags = [r.source, r.origin ?? r.layer, ...(r.targets.length ? [r.targets.join(",")] : []), ...(r.nameOnly ? ["name-only"] : []), ...(r.invocation.model ? [] : ["user-only"])];
+              const tags = [r.origin, ...(r.nameOnly ? ["name-only"] : []), ...(r.invocation.model ? [] : ["user-only"])];
               return `  · ${ansi.bold(r.name)} ${r.description}${ansi.dim(` 〔${tags.join(" · ")}〕`)}`;
             })
             .join("\n") +
-            ansi.dim(
-              `\n  共 ${rs.length} 个 · 索引快照 ≈${Math.round(agent.skillsRegistry.indexBlock.length / 4)} tok · 会话内锁定（文件变更下个会话生效） · /skills <name> 显式注入`,
-            ) +
-            (agent.skillsRegistry.availableTargets.filter((t) => !config.skills.targets.includes(t)).length
-              ? ansi.amber(
-                  `\n  ⚠ 未激活的 target：${agent.skillsRegistry.availableTargets.filter((t) => !config.skills.targets.includes(t)).join(", ")} —— forge.config.json → skills.targets 加入并重启生效`,
-                )
-              : "") +
+            ansi.dim(`\n  共 ${rs.length} 个 · 全量注册（system prompt 只留一行摘要，模型用 skill_list/skill_read 按需翻阅） · /skills <name> 显式注入`) +
             (agent.skillsRegistry.diagnostics.length
-              ? ansi.error(`\n  ⚠ ${agent.skillsRegistry.diagnostics.length} 条诊断（覆盖/缺 vendor 等）`)
+              ? ansi.error(`\n  ⚠ ${agent.skillsRegistry.diagnostics.length} 条诊断（同名覆盖/解析告警等，详情见 flight 日志）`)
               : ""),
         );
       },

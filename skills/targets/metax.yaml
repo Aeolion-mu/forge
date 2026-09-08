@@ -1,7 +1,0 @@
-# 沐曦：通用层 + 官方 TileOPs 工程流（MIT）+ 差异层。
-name: metax
-label: 沐曦 MetaX（MACA）
-include:
-  - common
-  - vendor:metax-tileops
-  - delta:metax

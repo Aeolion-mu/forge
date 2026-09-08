@@ -86,7 +86,7 @@ const CONVERGENT_MAX_TURNS = Number(process.env.FORGE_CONVERGENT_MAX_TURNS) || 3
  */
 const AUTO_DIAGNOSE_TIMEOUT_MS = Number(process.env.FORGE_AUTO_DIAGNOSE_TIMEOUT_MS) || 4000;
 
-/** 内置 skills 根（仓库 skills/：common + delta + vendors + targets 三态组合）。src/kernel → 仓库根。 */
+/** 内置 skills 根（仓库 skills/：common + delta + vendors 全量注册，rev3 无开关）。src/kernel → 仓库根。 */
 const BUILTIN_SKILLS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../skills");
 
 const MAIN_SYSTEM_PROMPT = [
@@ -273,7 +273,7 @@ export class ForgeAgent {
   /** skill_read 工具集（实例级：D7 幂等读集随实例走；主 agent 与子 agent 共享注册表、各自记已读）。 */
   private readonly skillTools: AgentHarnessTool<object | undefined>[];
   /** 索引快照：create() 时一次渲染（D1）——systemPrompt 只读它，字节级恒定。 */
-  private readonly skillsIndexSnapshot: string;
+  private readonly skillsSummary: string;
   /** memory 索引快照（同 D1）：旧实现每次重读磁盘，memory_write 后即打穿前缀缓存（Q6 修复）。 */
   private readonly memIndexSnapshot: string;
   private readonly policy: PermissionPolicy;
@@ -311,7 +311,7 @@ export class ForgeAgent {
   private constructor(
     private readonly config: ForgeConfig,
     private readonly opts: ForgeAgentOptions,
-    deps: { harness: AgentHarness; lane: AgentLane; session: Session; skills: Skill[]; skillsRegistry: SkillsRegistry; skillsIndexSnapshot: string; memIndexSnapshot: string; skillTools: AgentHarnessTool<object | undefined>[]; env: NodeExecutionEnv; repo: JsonlSessionRepo; lsp: LspClient; flight: FlightRecorder | null; flightPath: string | null },
+    deps: { harness: AgentHarness; lane: AgentLane; session: Session; skills: Skill[]; skillsRegistry: SkillsRegistry; skillsSummary: string; memIndexSnapshot: string; skillTools: AgentHarnessTool<object | undefined>[]; env: NodeExecutionEnv; repo: JsonlSessionRepo; lsp: LspClient; flight: FlightRecorder | null; flightPath: string | null },
   ) {
     this.telemetry = new Telemetry(config.pricing);
     this.subTelemetry = new Telemetry(config.pricing);
@@ -327,7 +327,7 @@ export class ForgeAgent {
     this.session = deps.session;
     this.skills = deps.skills;
     this.skillsRegistry = deps.skillsRegistry;
-    this.skillsIndexSnapshot = deps.skillsIndexSnapshot;
+    this.skillsSummary = deps.skillsSummary;
     this.memIndexSnapshot = deps.memIndexSnapshot;
     this.skillTools = deps.skillTools;
     this.env = deps.env;
@@ -494,7 +494,6 @@ export class ForgeAgent {
     const skillsRegistry = SkillsRegistry.create({
       builtinRoot: BUILTIN_SKILLS_ROOT,
       builtin: config.skills.builtin,
-      activated: config.skills.targets,
       globalDir: join(gDir, "skills"),
       projectDir: resolve(config.workdir, ".forge", "skills"),
       ...(config.skills.compat
@@ -509,19 +508,19 @@ export class ForgeAgent {
         : {}),
       extraDirs: config.skills.dirs,
       overrides: config.skills.overrides,
-      indexBudgetTokens: config.skills.indexBudgetTokens,
     });
-    const skillsIndexSnapshot = skillsRegistry.indexBlock;
+    // rev3：skills 在 system prompt 里只占一行摘要（skill_list/skill_read 按需翻阅，agent 全权接管）。
+    const skillsSummary = skillsRegistry.summaryLine;
     const skillTools = makeSkillTools(skillsRegistry, config.workdir);
     if (skillsRegistry.records.length || skillsRegistry.diagnostics.length) {
-      const bySource = skillsRegistry.records.reduce<Record<string, number>>((acc, r) => {
-        acc[r.source] = (acc[r.source] ?? 0) + 1;
+      const byOrigin = skillsRegistry.records.reduce<Record<string, number>>((acc, r) => {
+        acc[r.origin] = (acc[r.origin] ?? 0) + 1;
         return acc;
       }, {});
       flight?.handle({
         type: "skills_loaded",
-        bySource,
-        indexTokens: Math.floor(skillsIndexSnapshot.length / 4),
+        byOrigin,
+        summaryTokens: Math.floor(skillsSummary.length / 4),
         diagnostics: skillsRegistry.diagnostics.slice(0, 20),
       });
     }
@@ -578,7 +577,7 @@ export class ForgeAgent {
         systemPrompt: () => {
           // 只读 create() 时定格的快照（skills 索引 + memory 索引）——字节级恒定，前缀缓存安全。
           const parts = [MAIN_SYSTEM_PROMPT, environmentBlock(config.workdir)];
-          if (skillsIndexSnapshot) parts.push(skillsIndexSnapshot);
+          if (skillsSummary) parts.push(skillsSummary);
           if (memIndexSnapshot) parts.push(memIndexSnapshot);
           return parts.join("\n\n");
         },
@@ -587,7 +586,7 @@ export class ForgeAgent {
     );
     const lane = await harness.lane("main", ctx);
 
-    self = new ForgeAgent(config, opts, { harness, lane, session, skills, skillsRegistry, skillsIndexSnapshot, memIndexSnapshot, skillTools, env, repo, lsp, flight, flightPath });
+    self = new ForgeAgent(config, opts, { harness, lane, session, skills, skillsRegistry, skillsSummary, memIndexSnapshot, skillTools, env, repo, lsp, flight, flightPath });
     return self;
   }
 
@@ -822,7 +821,7 @@ export class ForgeAgent {
       task,
       // 子 agent 共享主 agent 的 skills 索引快照（同一字符串引用，不重扫；append 工具 skill_read 已在只读集）
       systemPrompt: `SUBAGENT[${role}] 你是一个专职子 agent，只用只读工具完成被指派的子任务，最后用一句话给出结论。${
-        this.skillsIndexSnapshot ? `\n\n${this.skillsIndexSnapshot}` : ""
+        this.skillsSummary ? `\n\n${this.skillsSummary}` : ""
       }`,
       model,
       thinking,
@@ -893,7 +892,7 @@ export class ForgeAgent {
       const r = await this.runEphemeralAgent({
         task,
         // Convergent 同享 skills 索引快照：验收算子类工作时能查算子规范类 skill（skill_read 在 verifier 工具集）
-        systemPrompt: CONVERGENT_SYSTEM_PROMPT + (this.skillsIndexSnapshot ? `\n\n${this.skillsIndexSnapshot}` : ""),
+        systemPrompt: CONVERGENT_SYSTEM_PROMPT + (this.skillsSummary ? `\n\n${this.skillsSummary}` : ""),
         model,
         thinking,
         tools: this.verifierToolset(),

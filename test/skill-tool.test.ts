@@ -6,11 +6,13 @@ import { dirname, join } from "node:path";
 import { SkillsRegistry } from "../src/kernel/skills.js";
 import { makeSkillTools } from "../src/tools/skill-tool.js";
 
-/** P2：skill_read 工具——白名单、幂等（D7）、分段读、资源清单、截断。 */
+/** rev3：skill_list（翻清单）+ skill_read（读全文，白名单/幂等/分段/截断）。 */
 
 let root = "";
 let registry: SkillsRegistry;
-let tool: ReturnType<typeof makeSkillTools>[number];
+let tools: ReturnType<typeof makeSkillTools>;
+let list: ReturnType<typeof makeSkillTools>[number];
+let read: ReturnType<typeof makeSkillTools>[number];
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "forge-skilltool-"));
@@ -26,24 +28,68 @@ beforeEach(() => {
   wf("proj/.forge/skills/huge/SKILL.md", `---\nname: huge\ndescription: 巨大正文\n---\n\n${"行。".repeat(6000)}`);
   wf("proj/.forge/skills/locked/SKILL.md", "---\nname: locked\ndescription: user-only 样本\ndisable-model-invocation: true\n---\n正文");
   registry = SkillsRegistry.create({
-    builtin: false, activated: ["common"],
+    builtin: false,
     globalDir: join(root, "none-global"), projectDir: join(root, "proj/.forge/skills"),
   });
-  tool = makeSkillTools(registry, join(root, "proj"))[0]!;
+  tools = makeSkillTools(registry, join(root, "proj"));
+  list = tools.find((t) => t.name === "skill_list")!;
+  read = tools.find((t) => t.name === "skill_read")!;
 });
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-async function read(params: { name: string; section?: string }): Promise<{ text: string; details: Record<string, unknown> }> {
+async function call(tool: typeof read, params: Record<string, unknown>): Promise<{ text: string; details: Record<string, unknown> }> {
   const r = await tool.execute("id", params as never);
   return { text: (r.content[0] as { text: string }).text, details: (r.details ?? {}) as Record<string, unknown> };
 }
 
+// ---------------------------------------------------------------------------
+// skill_list：翻清单（rev3 的发现性入口）
+// ---------------------------------------------------------------------------
+
+test("skill_list：按分区分组列出 name+description；同注册表输出确定", async () => {
+  const { text, details } = await call(list, {});
+  assert.match(text, /〔user〕3 个/);
+  assert.match(text, /- long-doc — 长文档样本/);
+  assert.match(text, /- locked — user-only 样本/);
+  assert.equal(details.count, 3);
+  assert.equal((await call(list, {})).text, text); // 确定性
+});
+
+test("skill_list：partition / filter 收窄；无匹配给分区提示", async () => {
+  const byFilter = await call(list, { filter: "巨大" });
+  assert.equal(byFilter.details.count, 1);
+  assert.match(byFilter.text, /- huge — /);
+
+  const none = await call(list, { partition: "vendor:geak" });
+  assert.equal(none.details.count, 0);
+  assert.match(none.text, /没有匹配的 skill/);
+  assert.match(none.text, /现有分区：user/);
+});
+
+test("skill_list：超长清单走截断（partition/filter 提示）", async () => {
+  // 直接构造大注册表（100 个）验证截断路径
+  const bigRoot = join(root, "big/.forge/skills");
+  for (let i = 0; i < 100; i++) {
+    mkdirSync(join(bigRoot, `s${i}`), { recursive: true });
+    writeFileSync(join(bigRoot, `s${i}/SKILL.md`), `---\nname: s${i}\ndescription: 样本 ${i} ${"描述".repeat(40)}\n---\n正文`, "utf8");
+  }
+  const bigReg = SkillsRegistry.create({ builtin: false, globalDir: join(root, "ng"), projectDir: bigRoot });
+  const bigList = makeSkillTools(bigReg, join(root, "big")).find((t) => t.name === "skill_list")!;
+  const { text } = await call(bigList, {});
+  assert.match(text, /已截断/);
+  assert.match(text, /partition \/ filter/);
+});
+
+// ---------------------------------------------------------------------------
+// skill_read：读全文（D2/D7 语义不变）
+// ---------------------------------------------------------------------------
+
 test("正常读取：frontmatter 剥离、正文完整、资源清单列出", async () => {
-  const { text, details } = await read({ name: "long-doc" });
-  assert.match(text, /\[skill: long-doc\]/);
+  const { text, details } = await call(read, { name: "long-doc" });
+  assert.match(text, /\[skill: long-doc\]（user）/);
   assert.match(text, /## 调参/);
   assert.ok(!text.includes("description: 长文档样本"), "frontmatter 不应出现在正文里");
   assert.match(text, /references\/isa\.md/);
@@ -52,41 +98,37 @@ test("正常读取：frontmatter 剥离、正文完整、资源清单列出", as
   assert.equal(details.name, "long-doc");
 });
 
-test("D7 会话内幂等：同 name 二次调用只返回短注记，不重复注入", async () => {
-  const first = await read({ name: "long-doc" });
+test("D7 会话内幂等：同 name 二次调用只返回短注记，不重复注入；section 不受拦截", async () => {
+  const first = await call(read, { name: "long-doc" });
   assert.ok(!first.details.deduped);
-  const second = await read({ name: "long-doc" });
+  const second = await call(read, { name: "long-doc" });
   assert.equal(second.details.deduped, true);
   assert.match(second.text, /已加载过/);
   assert.ok(!second.text.includes("## 调参"), "正文不应重复注入");
-  // section 参数不受幂等拦截（分段读是正常需求）
-  const section = await read({ name: "long-doc", section: "调参" });
+  const section = await call(read, { name: "long-doc", section: "调参" });
   assert.match(section.text, /num_warps/);
   assert.ok(!section.text.includes("## 迁移"), "只取命中段");
 });
 
-test("section 未命中 → 可读错误", async () => {
-  const { text, details } = await read({ name: "long-doc", section: "不存在的段" });
-  assert.equal(details.ok, false);
-  assert.match(text, /没有匹配/);
-});
-
-test("注册表外 name → 可读错误 + 前缀建议", async () => {
-  const { text, details } = await read({ name: "long" });
-  assert.equal(details.ok, false);
-  assert.match(text, /未找到 skill「long」/);
-  assert.match(text, /long-doc/); // 建议列表
+test("section 未命中 / 注册表外 name → 可读错误（建议来自注册表）", async () => {
+  const miss = await call(read, { name: "long-doc", section: "不存在的段" });
+  assert.equal(miss.details.ok, false);
+  assert.match(miss.text, /没有匹配/);
+  const nope = await call(read, { name: "long" });
+  assert.equal(nope.details.ok, false);
+  assert.match(nope.text, /未找到 skill「long」/);
+  assert.match(nope.text, /long-doc/);
 });
 
 test("user-only（disable-model-invocation）→ 拒绝模型侧调用", async () => {
-  const { text, details } = await read({ name: "locked" });
+  const { text, details } = await call(read, { name: "locked" });
   assert.equal(details.ok, false);
   assert.match(text, /user-only/);
   assert.match(text, /\/skills locked/);
 });
 
 test("超长正文走 artifacts 截断（首尾 + section 提示）", async () => {
-  const { text, details } = await read({ name: "huge" });
+  const { text, details } = await call(read, { name: "huge" });
   assert.equal(details.truncated, true);
   assert.match(text, /已截断/);
   assert.match(text, /section 参数/);
@@ -94,9 +136,10 @@ test("超长正文走 artifacts 截断（首尾 + section 提示）", async () =
 
 test("P4：成功加载记入 registry.usedList（幂等去重；失败不记）", async () => {
   assert.deepEqual(registry.usedList(), []);
-  await read({ name: "long-doc" });
-  await read({ name: "long-doc" }); // 幂等的重复调用不重复记
-  await read({ name: "locked" }); // user-only 拒绝 → 不记
-  await read({ name: "nope" }); // 未找到 → 不记
+  await call(read, { name: "long-doc" });
+  await call(read, { name: "long-doc" }); // 幂等的重复调用不重复记
+  await call(read, { name: "locked" }); // user-only 拒绝 → 不记
+  await call(read, { name: "nope" }); // 未找到 → 不记
+  await call(list, {}); // skill_list 不算「已读」
   assert.deepEqual(registry.usedList(), ["long-doc"]);
 });

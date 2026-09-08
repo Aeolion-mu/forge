@@ -1,6 +1,0 @@
-# 燧原：通用层 + 差异层（公开面最薄，torch-gcu manuals 是主资料）。
-name: enflame
-label: 燧原 GCU
-include:
-  - common
-  - delta:enflame

@@ -27,7 +27,7 @@ function config(workdir: string, over: Partial<ForgeConfig["skills"]> = {}): For
     models: [],
     workdir,
     skillsDirs: [join(workdir, ".forge", "skills")],
-    skills: { builtin: false, targets: ["common"], dirs: [], compat: false, indexBudgetTokens: 1500, overrides: {}, ...over },
+    skills: { builtin: false, dirs: [], compat: false, overrides: {}, ...over },
     sessionsDir: join(workdir, ".forge-sessions"),
     auditPath: join(workdir, ".forge-audit.jsonl"),
     compaction: { reserveTokens: 16384, keepRecentTokens: 20000 },
@@ -60,8 +60,8 @@ test("P1：skills 索引块注入 system prompt，且会话内字节级稳定（
     await agent.run("第一轮");
     assert.equal(calls.length, 1);
     const sp1 = calls[0]!.systemPrompt;
-    assert.match(sp1, /【Skills 索引】/);
-    assert.match(sp1, /triton-basics — Triton kernel 工程基础与调参/);
+    assert.match(sp1, /【Skills】本机共 1 个算子开发 skills（user 1）。skill_list/); // 一行摘要（rev3）
+    assert.ok(!sp1.includes("Triton kernel 工程基础"), "清单/正文不常驻 system prompt（按需翻阅）");
     assert.match(sp1, /【长期记忆索引】/); // memory 索引块同样在
     assert.match(sp1, /proj-note/);
 
@@ -86,7 +86,7 @@ test("P1：skills 索引块注入 system prompt，且会话内字节级稳定（
   }
 });
 
-test("P1：内置 targets/common.yaml 可解析（默认 target 不报 unknown_target）", async () => {
+test("P1：仓库 skills/ 全量注册——system prompt 只有一行摘要，common/delta 全部可 skill_read", async () => {
   const dir = mkdtempSync(join(tmpdir(), "forge-p1b-"));
   const prevGlobal = process.env.FORGE_GLOBAL_DIR;
   process.env.FORGE_GLOBAL_DIR = join(dir, "home");
@@ -97,10 +97,12 @@ test("P1：内置 targets/common.yaml 可解析（默认 target 不报 unknown_t
     await agent.run("跑一下");
     await agent.dispose();
     assert.equal(calls.length, 1);
-    // 仓库 skills/ 的 common 层（3 个通用 skill）经 targets/common.yaml 进入索引；无 unknown_target。
-    assert.match(calls[0]!.systemPrompt, /【Skills 索引】/);
-    assert.match(calls[0]!.systemPrompt, /triton-kernel-basics/);
-    assert.ok(!agent.skillsRegistry.diagnostics.some((d) => d.code === "unknown_target"));
+    // rev3：摘要行常驻（总量 + 分区计数），清单不常驻；注册表全量（含 7 家 delta，vendor 随本机 fetch 状态）
+    assert.match(calls[0]!.systemPrompt, /【Skills】本机共 \d+ 个算子开发 skills（.*common 3/);
+    assert.ok(!calls[0]!.systemPrompt.includes("- triton-kernel-basics —"));
+    for (const v of ["amd", "ascend", "enflame", "hygon", "iluvatar", "metax", "nvidia"]) {
+      assert.ok(agent.skillsRegistry.records.some((r) => r.origin === `delta:${v}`), `delta:${v} 应已注册`);
+    }
   } finally {
     if (prevGlobal === undefined) delete process.env.FORGE_GLOBAL_DIR;
     else process.env.FORGE_GLOBAL_DIR = prevGlobal;
@@ -171,10 +173,8 @@ test("P4 e2e：子 agent 的 system prompt 含同一份 skills 索引快照", as
 
     assert.ok(subPrompt, "子 agent 应至少被调用一次");
     assert.match(subPrompt!, /^SUBAGENT\[researcher\]/);
-    assert.match(subPrompt!, /【Skills 索引】/);
-    assert.match(subPrompt!, /op-guide — 算子开发守则样本/);
-    // 与主 agent 同一份快照：字节一致（同一字符串引用的运行时体现）
-    assert.ok(subPrompt!.includes(agent.skillsRegistry.indexBlock));
+    // 与主 agent 同一行摘要（rev3：索引块退位为一行 summary）
+    assert.ok(subPrompt!.includes(agent.skillsRegistry.summaryLine), "子 agent 应共享同一份 skills 摘要");
   } finally {
     if (prevGlobal === undefined) delete process.env.FORGE_GLOBAL_DIR;
     else process.env.FORGE_GLOBAL_DIR = prevGlobal;

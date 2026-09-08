@@ -31,6 +31,34 @@
 
 ---
 
+## 2026-09-08（晚） · rev3：拆掉 targets 开关，全量注册 + agent 按需翻阅
+
+**动机（实测）**：rev2 的 targets 白名单把发现性卡死在配置侧——默认只挂 common 时，用户问模型「有哪些 skills」
+它只能列 5 个，说不清还有哪些芯片可开；改配置还要重启。用户拍板：「别搞这么复杂，把开关去掉，让 agent 全权接管，
+只留一句摘要，想看自己去翻」。
+
+| 项 | rev2 → rev3 |
+|---|---|
+| 注册 | targets/*.yaml 白名单预选 → **启动全量注册**（common → vendors/* → delta/* → 用户层；同名后读覆盖先读，delta 特化胜 vendor 家底） |
+| system prompt | 1500 tok 分层裁剪索引块 → **一行总量摘要**（各分区计数 + 指路，~40 tok） |
+| 发现性 | 索引内清单 → 新工具 **`skill_list(partition/filter)`**（分区分组、确定性输出、超长截断指路）+ `skill_read`（幂等等语义不变） |
+| config | 删 `skills.targets` / `indexBudgetTokens`（出现即「已移除」明确报错）；保留 builtin/compat/dirs/overrides |
+| 删除 | `skills/targets/`（10 个 yaml）、resolveTargets/renderIndex 分层裁剪、manifest 解析（git 可回溯） |
+
+**学到**：白名单护的是「无关 skills 占上下文」，但代价是发现性；真正两全的是「常驻足迹压到一行 +
+清单本身也走工具按需拉」——append-only 纪律下，按需翻清单比预选清单更省也更活。索引分层裁剪那套
+预算机制随之自然消亡（没有常驻索引就没有裁剪问题）。
+
+**vendor 兼容（实拉数据驱动）**：全量注册暴露两家「装不进」——tensormux 完全没有 frontmatter（35 个
+全被跳过）→ SKILL.md 缺 description 时从正文 `## Purpose`/首段**降级提取**（计 no_frontmatter 警告，
+不丢内容：适配发生在 loader，vendor 快照不改一行）；TileOPs 把 skills 放 `.claude/skills/` 下（点开头目录
+被跳过）→ 扫描器放行 `.claude`/`.agents` 标准 agent 目录。修复后 6 家 vendor 全量注册：**91 个 skills**
+（common 3 · delta 7 · vendors 81），62 条诊断如实记录不规范。
+
+测试 355 → **341**（manifest/裁剪用例随机制删除，新增 skill_list/摘要/全量注册用例），typecheck clean。
+
+---
+
 ## 2026-09-07 ~ 09-08 · TUI / CLI 打磨冲刺（git 历史 36 commits）
 
 会话管理：`/resume` 字节级还原（修三处根因：空会话/冻结/转录倒序）+ `/rewind` 回滚重编辑（修渲染缓存陈旧）；resume 后输入历史种子。

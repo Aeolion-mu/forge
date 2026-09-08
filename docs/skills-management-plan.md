@@ -1,6 +1,14 @@
 # Forge Skills 管理机制 · 实施计划书
 
 > 2026-09-08 · 调研基线：forge @ main（1f4c35f）· pi-agent-core 0.85.1 · rev2：合并「物理三态 × 逻辑组合」架构（§4 重写）
+>
+> **⚠ rev3（同日，实测后用户决策）**：§4.3 的 targets manifest 白名单**已拆除**——实测发现它把发现性
+> 卡死在配置侧（默认只挂 common 时，模型看不到也说不清还有哪些芯片可开）。现行架构：
+> 启动**全量注册**（`common → vendors/* → delta/* → 用户层`，同名后读覆盖先读）、system prompt 只留
+> **一行总量摘要**（`renderSummaryLine`）、发现性交给新工具 **`skill_list(partition/filter)`** +
+> `skill_read`。`skills/targets/` 目录与 `resolveTargets`/`renderIndex`（分层裁剪）已删，config 的
+> `skills.targets`/`indexBudgetTokens` 已移除（出现即报「已移除」明确错误）。§4.3-4.6 与 §5 作为
+> rev2 的设计记录保留（git 历史可回溯实现）；物理三态布局（§4.2）与 vendors 更新纪律（§4.5）仍然有效。
 > 定位：forge 转型「算子开发专用 AI 编程工具」的第一步——把 skills 从「库的一个资源类型」升级为
 > **forge 自己的一等机制**：内置算子 skills（昇腾/Triton/天数/沐曦/燧原/海光/NVIDIA/AMD 分区）+ 用户自定义 + 统一索引 + 按需加载。
 > 硬约束：DeepSeek 纯前缀磁盘缓存（append-only）、上下文预算、零新依赖、每个功能配 node:test 单测、LIVE-only。

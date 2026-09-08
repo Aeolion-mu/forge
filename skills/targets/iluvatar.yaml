@@ -1,6 +1,0 @@
-# 天数智芯：通用层 + 差异层（FlyDSL/TLE/FlagGems 路线指引）。
-name: iluvatar
-label: 天数智芯 Iluvatar Corex
-include:
-  - common
-  - delta:iluvatar

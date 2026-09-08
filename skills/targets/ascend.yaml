@@ -1,6 +1,0 @@
-# 昇腾：通用层 + 昇腾差异层（官方 cannbot/agent-skills 受 CANN OSL 协议限制不 vendor，路线与入口在 delta 内指引）。
-name: ascend
-label: 昇腾 Ascend（CANN）
-include:
-  - common
-  - delta:ascend
