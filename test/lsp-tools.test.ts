@@ -8,13 +8,30 @@ import { readFileSync } from "node:fs";
 import { locateSymbol, makeLspTools, applyTextEdits } from "../src/tools/lsp-tools.js";
 import { LspClient, type RenameEdit } from "../src/kernel/lsp-client.js";
 
-test("locateSymbol：首个词边界匹配 / 指定行 / 未命中", () => {
+test("locateSymbol：自动定位三级链 / 指定行 / 未命中", async () => {
   const src = "x = 1\ndef add(a, b):\n    return add\n";
-  assert.deepEqual(locateSymbol(src, "add"), { line: 2, col: 5 }); // def␣add → col5
-  assert.deepEqual(locateSymbol(src, "add", 3), { line: 3, col: 12 }); // 指定行内 return add
-  assert.equal(locateSymbol(src, "nope"), undefined);
+  assert.deepEqual(await locateSymbol(src, "add"), { line: 2, col: 5 }); // def␣add → col5
+  assert.deepEqual(await locateSymbol(src, "add", 3), { line: 3, col: 12 }); // 指定行内 return add
+  assert.equal(await locateSymbol(src, "nope"), undefined);
   // 词边界：不命中 "address" 里的子串
-  assert.equal(locateSymbol("address = 1\n", "add"), undefined);
+  assert.equal(await locateSymbol("address = 1\n", "add"), undefined);
+});
+
+test("locateSymbol：注释先提及符号时不落进注释（自测暴露的 LSP 空结果根因）", async () => {
+  // ① outline 语法级：注释/文档块先出现符号名 → 定位到真实定义行
+  const py = "# add 是加法函数\n# 见 add 的实现\nx = 1\n\ndef add(a, b):\n    return a + b\n";
+  assert.deepEqual(await locateSymbol(py, "add", undefined, ".py"), { line: 5, col: 5 });
+  const ts = "/**\n * locateSymbol 定位符号\n */\nexport async function locateSymbol(): Promise<void> {}\n";
+  assert.deepEqual(await locateSymbol(ts, "locateSymbol", undefined, ".ts"), { line: 4, col: 23 });
+  // ② 无 langKey（outline 不可用）→ 跳过注释行的首个匹配
+  const py2 = "# add 注释\ny = add(1)\n\ndef add(a, b):\n    return a + b\n";
+  assert.deepEqual(await locateSymbol(py2, "add"), { line: 2, col: 5 });
+  // 导入行同样跳过
+  const py3 = "from lib import helper\n\nz = helper(1)\n";
+  assert.deepEqual(await locateSymbol(py3, "helper"), { line: 3, col: 5 });
+  // ③ 全是注释时兜底仍能命中（宁可有落点）
+  const onlyComment = "# uses add here\n";
+  assert.deepEqual(await locateSymbol(onlyComment, "add"), { line: 1, col: 8 });
 });
 
 const tool = (tools: AgentTool[], name: string) =>

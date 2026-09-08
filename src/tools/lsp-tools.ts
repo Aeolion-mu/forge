@@ -5,6 +5,7 @@ import type { TextContent } from "@earendil-works/pi-ai";
 import { resolveReadPath } from "./fs-tools.js";
 import { computeFileDiff, type FileDiff } from "../ui/diff.js";
 import { lspLangForPath, type LspClient, type LspLocation, type RenameEdit } from "../kernel/lsp-client.js";
+import { langKeyForPath, outlineSource } from "../kernel/code-outline.js";
 
 const txt = (t: string): TextContent[] => [{ type: "text", text: t }];
 
@@ -13,19 +14,49 @@ function esc(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** 文本级定位时跳过的行：注释（// # * /*）与导入——这些位置 LSP 解析不出语义符号。 */
+const NOISE_LINE = /^(?:\/\/|#|\*|\/\*|import |from )/;
+
 /**
- * 在源码里定位符号名的位置（1-based 行/列）。指定 line 则只在该行找；否则取首个词边界匹配。
- * 朴素文本定位（可能命中注释/子串），但足够给 LSP 一个落点，语义由 server 解析。
+ * 在源码里定位符号名的位置（1-based 行/列）。指定 line 则只在该行找；缺省按三级链定位：
+ * ① outline 语法级（tree-sitter 抽同名**定义**符号——注释/字符串/导入天然不误命中，
+ *    曾有自测暴露：中文注释先提及函数名，首个文本匹配落在注释里 → LSP 三工具全返回空）；
+ * ② 跳过注释/导入行的首个词边界匹配（局部变量等 outline 覆盖不到的符号）；
+ * ③ 任意首个匹配兜底（旧行为）。语义最终由 server 解析，这里只给一个落点。
  */
-export function locateSymbol(source: string, symbol: string, line?: number): { line: number; col: number } | undefined {
+export async function locateSymbol(
+  source: string,
+  symbol: string,
+  line?: number,
+  langKey?: string,
+): Promise<{ line: number; col: number } | undefined> {
   const lines = source.split("\n");
   const re = new RegExp(`\\b${esc(symbol)}\\b`);
   if (line !== undefined) {
     const m = re.exec(lines[line - 1] ?? "");
     return m ? { line, col: m.index + 1 } : undefined;
   }
+  // ① 语法级：outline 找同名定义符号
+  if (langKey) {
+    try {
+      const hit = (await outlineSource(source, langKey)).find((s) => s.name === symbol);
+      if (hit) {
+        const m = re.exec(lines[hit.startLine - 1] ?? "");
+        if (m) return { line: hit.startLine, col: m.index + 1 };
+      }
+    } catch {
+      /* outline 失败（无 grammar 等）→ 退回文本定位 */
+    }
+  }
+  // ② 跳过注释/导入行
   for (let i = 0; i < lines.length; i++) {
-    const m = re.exec(lines[i]);
+    if (NOISE_LINE.test(lines[i]!.trimStart())) continue;
+    const m = re.exec(lines[i]!);
+    if (m) return { line: i + 1, col: m.index + 1 };
+  }
+  // ③ 兜底：任意首个匹配
+  for (let i = 0; i < lines.length; i++) {
+    const m = re.exec(lines[i]!);
     if (m) return { line: i + 1, col: m.index + 1 };
   }
   return undefined;
@@ -53,7 +84,9 @@ export function applyTextEdits(content: string, edits: RenameEdit[]): string {
 const symSchema = Type.Object({
   path: Type.String({ description: "符号所在文件（相对 workdir；开启越界只读时可绝对路径）" }),
   symbol: Type.String({ description: "符号名（函数/类/变量名）" }),
-  line: Type.Optional(Type.Number({ description: "符号所在行号（1-based），多处同名时用它消歧；缺省取首个匹配" })),
+  line: Type.Optional(
+    Type.Number({ description: "符号所在行号（1-based），多处同名时用它消歧；缺省自动定位（优先语法大纲，跳过注释/导入行），通常不用传" }),
+  ),
 });
 
 const UNAVAILABLE = "LSP 未就绪（该语言无 server 或未安装，仅 py/ts/tsx/js/jsx 支持）。请改用 grep / outline 代替。";
@@ -63,9 +96,9 @@ const UNAVAILABLE = "LSP 未就绪（该语言无 server 或未安装，仅 py/t
  * 再交 language server 做跨文件语义解析）。比 grep 准、跨文件。server 缺失则提示并建议回退。
  */
 export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside = false): AgentHarnessTool<object | undefined>[] {
-  const locate = (path: string, symbol: string, line?: number) => {
+  const locate = async (path: string, symbol: string, line?: number) => {
     const abs = resolveReadPath(workdir, path, allowReadOutside);
-    return locateSymbol(readFileSync(abs, "utf8"), symbol, line);
+    return locateSymbol(readFileSync(abs, "utf8"), symbol, line, langKeyForPath(abs));
   };
 
   const references: AgentHarnessTool<object | undefined, typeof symSchema, { found: boolean; count: number }> = {
@@ -75,7 +108,7 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     parameters: symSchema,
     execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       if (!lspLangForPath(p.path)) return { content: txt(UNAVAILABLE), details: { found: false, count: 0 } };
-      const pos = locate(p.path, p.symbol, p.line);
+      const pos = await locate(p.path, p.symbol, p.line);
       if (!pos) return { content: txt(`未在 ${p.path} 找到符号 ${p.symbol}`), details: { found: false, count: 0 } };
       const refs = await lsp.references(p.path, pos.line, pos.col);
       if (refs === undefined) return { content: txt(UNAVAILABLE), details: { found: false, count: 0 } };
@@ -91,7 +124,7 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     parameters: symSchema,
     execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       if (!lspLangForPath(p.path)) return { content: txt(UNAVAILABLE), details: { found: false, count: 0 } };
-      const pos = locate(p.path, p.symbol, p.line);
+      const pos = await locate(p.path, p.symbol, p.line);
       if (!pos) return { content: txt(`未在 ${p.path} 找到符号 ${p.symbol}`), details: { found: false, count: 0 } };
       const defs = await lsp.definition(p.path, pos.line, pos.col);
       if (defs === undefined) return { content: txt(UNAVAILABLE), details: { found: false, count: 0 } };
@@ -107,7 +140,7 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     parameters: symSchema,
     execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       if (!lspLangForPath(p.path)) return { content: txt(UNAVAILABLE), details: { found: false } };
-      const pos = locate(p.path, p.symbol, p.line);
+      const pos = await locate(p.path, p.symbol, p.line);
       if (!pos) return { content: txt(`未在 ${p.path} 找到符号 ${p.symbol}`), details: { found: false } };
       const h = await lsp.hover(p.path, pos.line, pos.col);
       if (h === undefined) return { content: txt(UNAVAILABLE), details: { found: false } };
@@ -131,7 +164,7 @@ export function makeLspTools(workdir: string, lsp: LspClient, allowReadOutside =
     execute: async (_id, p, _onUpdate, _toolCtx, _invocation, _ctx) => {
       const args = p as { path: string; symbol: string; newName: string; line?: number };
       if (!lspLangForPath(args.path)) return { content: txt(UNAVAILABLE), details: { found: false, files: 0, diffs: [] } };
-      const pos = locate(args.path, args.symbol, args.line);
+      const pos = await locate(args.path, args.symbol, args.line);
       if (!pos) return { content: txt(`未在 ${args.path} 找到符号 ${args.symbol}`), details: { found: false, files: 0, diffs: [] } };
       const changes = await lsp.rename(args.path, pos.line, pos.col, args.newName);
       if (changes === undefined) return { content: txt(UNAVAILABLE), details: { found: false, files: 0, diffs: [] } };
