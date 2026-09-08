@@ -431,6 +431,9 @@ test("仓库 targets/：10 个 manifest 全部可解析、无诊断；availableT
   });
   assert.deepEqual(reg.availableTargets, ["amd", "ascend", "common", "enflame", "flagos", "hygon", "iluvatar", "metax", "nvidia", "triton"]);
   assert.ok(reg.get("triton-kernel-basics")!.targets.includes("common"));
+  // 索引尾部提示未激活 target（发现性），不含 common 别名
+  assert.match(reg.indexBlock, /另有未激活的芯片 target：amd、ascend、enflame/);
+  assert.ok(!reg.indexBlock.includes("target：common"));
 });
 
 test("仓库 common 层：3 个通用 skill 可解析", () => {

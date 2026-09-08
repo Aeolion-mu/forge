@@ -471,6 +471,8 @@ export interface RenderIndexOptions {
   activated: string[];
   /** manifest label（target 分组标题用；无则用 name）。 */
   labels?: Record<string, string>;
+  /** 未激活的 target 名（尾部提示行：模型能告诉用户还能开什么；不含 common 层别名）。 */
+  inactiveTargets?: string[];
   /** 单行 description 截断长度（默认 160 字符）。 */
   maxDescChars?: number;
 }
@@ -546,9 +548,14 @@ export function renderIndex(records: SkillRecord[], budgetTokens: number, opts: 
   };
   const assemble = (groups: Array<{ title: string; body: string }>, tailNote: string): string => {
     const parts = [INDEX_HEADER, ...groups.map((g) => `${g.title}\n${g.body}`)];
-    if (tailNote) parts.push(tailNote);
+    const notes = [tailNote, inactiveNote].filter(Boolean).join("\n");
+    if (notes) parts.push(notes);
     return parts.join("\n\n");
   };
+  // 未激活 target 提示（发现性：模型能告诉用户还能开什么；计入预算，~20 tok）
+  const inactiveNote = opts.inactiveTargets?.length
+    ? `（另有未激活的芯片 target：${opts.inactiveTargets.join("、")}——用户要做这些芯片的工作时，提示其在 forge.config.json → skills.targets 加入并重启启用）`
+    : "";
 
   const full = assemble(buildGroups(lines, "full"), "");
   if (fits(full)) return full;
@@ -728,7 +735,11 @@ export class SkillsRegistry {
       else records.push(r);
     }
 
-    const indexBlock = renderIndex(records, opts.indexBudgetTokens ?? 1500, { activated: opts.activated, labels });
+    const indexBlock = renderIndex(records, opts.indexBudgetTokens ?? 1500, {
+      activated: opts.activated,
+      labels,
+      inactiveTargets: available.filter((t) => t !== "common" && !opts.activated.includes(t)),
+    });
     return new SkillsRegistry(records, diagnostics, indexBlock, available);
   }
 
