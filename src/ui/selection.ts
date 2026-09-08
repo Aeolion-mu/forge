@@ -1,4 +1,5 @@
 import { isWide } from "./markdown.js";
+import { SEL_ON, SEL_OFF } from "./theme.js";
 
 /**
  * 应用内选择模型（纯函数，可单测）——Claude Code 式拖选/双击选词/三击选行的数学层。
@@ -64,19 +65,26 @@ export function plainOf(ansiLine: string): string {
 }
 
 /**
- * 给 ANSI 行的可见列区间套反显高亮：区间内字符前插 `\x1b[7m`、出区间插 `\x1b[27m`
- * （选择性反显——与已有前景/背景色叠加，不撕裂转义序列）。列语义同 plainSlice。
+ * 给 ANSI 行的可见列区间套选区高亮（Claude Code / 原生终端选择语义）：
+ * 区间内统一 SEL_ON 观感（蓝底亮白），**原有 SGR 全部剥离**（diff 色带 / 语法色 /
+ * 灰底在选区内让位）；离开区间（或行尾）发 SEL_OFF 后**重放**区间前累计的样式
+ * （自上一个 `\x1b[0m` 以来的 SGR 串），区间后的文本颜色不丢。列语义同 plainSlice。
  */
 export function highlightRange(ansiLine: string, colStart: number, colEnd: number): string {
   let out = "";
   let col = 0;
   let i = 0;
   let on = false;
+  let styleSinceReset = ""; // 区间外累计的 SGR（遇 \x1b[0m 清空）——出界后重放
   while (i < ansiLine.length) {
     SGR.lastIndex = i;
     const m = SGR.exec(ansiLine);
     if (m && m.index === i) {
-      out += m[0];
+      if (!on) {
+        out += m[0];
+        styleSinceReset = m[0] === "\x1b[0m" ? "" : styleSinceReset + m[0];
+      }
+      // 区间内的 SGR 丢弃：选区内不保留原有颜色
       i = SGR.lastIndex;
       continue;
     }
@@ -85,17 +93,17 @@ export function highlightRange(ansiLine: string, colStart: number, colEnd: numbe
     const w = isWide(cp) ? 2 : 1;
     const inRange = col + w > colStart && col < colEnd;
     if (inRange && !on) {
-      out += "\x1b[7m";
+      out += SEL_ON;
       on = true;
     } else if (!inRange && on) {
-      out += "\x1b[27m";
+      out += SEL_OFF + styleSinceReset;
       on = false;
     }
     out += ch;
     col += w;
     i += ch.length;
   }
-  if (on) out += "\x1b[27m";
+  if (on) out += SEL_OFF + styleSinceReset;
   return out;
 }
 

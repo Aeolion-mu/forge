@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Text, useInput, usePaste } from "ink";
 import * as ed from "./text-editor.js";
 import { normalizeInputSelection, type InputSelection } from "./input-selection.js";
+import { SEL_ON, SEL_OFF } from "./theme.js";
 
 /**
  * 多行输入框 —— 取代单行的 ink-text-input（其多行渲染会糊、且 ↑/↓ 一律翻历史）。
@@ -12,7 +13,7 @@ import { normalizeInputSelection, type InputSelection } from "./input-selection.
  * · 粘贴：ink 批量投递为一段含 \n 的 input，整段插入（不会逐行误触发提交）。
  * · 回车提交；Alt/Shift+回车插入换行（终端支持时）。菜单打开时把 ↑/↓/Tab 让给菜单（父另接）。
  * · 鼠标：点击定位光标（父换算好字符下标经 cursorRequest 传入）；拖选建立选区
- *   （selection 反显高亮，父持有状态——打字/删除即替换选中区间并清空）。
+ *   （selection 蓝底高亮，父持有状态——打字/删除即替换选中区间并清空）。
  */
 export function MultilineInput({
   value,
@@ -36,7 +37,7 @@ export function MultilineInput({
   /** 鼠标点击输入框的目标字符下标（父已按 `› ` 前缀与宽度折算好）→ 请求把光标移到该处。消费后调 onCursorRequestHandled 清空。 */
   cursorRequest?: number | null;
   onCursorRequestHandled?: () => void;
-  /** 输入选区（value 字符下标 anchor→active）；非退化时反显选中段，光标块隐藏。 */
+  /** 输入选区（value 字符下标 anchor→active）；非退化时选中段套蓝底，光标块隐藏。 */
   selection?: InputSelection | null;
 }) {
   const [cursor, setCursor] = useState(value.length);
@@ -135,14 +136,13 @@ export function MultilineInput({
     { isActive },
   );
 
-  // 渲染：有选区 → 反显选中段（光标块隐藏）；否则 before + 反显光标块 + after。
+  // 渲染：有选区 → 选中段套蓝底（与视口选区同一对 SEL 常量；Ink 不转义字符串内的
+  // ANSI 序列，直接拼接即可）；否则 before + 反显光标块 + after。
   const sel = normalizeInputSelection(selection ?? null);
   if (sel) {
     return (
       <Text>
-        {value.slice(0, sel.start)}
-        <Text inverse>{value.slice(sel.start, sel.end)}</Text>
-        {value.slice(sel.end)}
+        {value.slice(0, sel.start) + SEL_ON + value.slice(sel.start, sel.end) + SEL_OFF + value.slice(sel.end)}
       </Text>
     );
   }

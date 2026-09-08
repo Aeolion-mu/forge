@@ -53,6 +53,34 @@ export function visibleWidth(s: string): number {
   return vwidth(s);
 }
 
+/** 按可见宽度截断（ANSI 感知：转义占 0 列原样保留，超宽字符丢弃，以 … 收尾）。
+ *  chrome 行（菜单/选择器/确认行）超宽会被 Ink 折行、打乱屏幕行号映射——入屏前先截断。 */
+export function truncateVisible(s: string, width: number): string {
+  if (width < 1) return "";
+  if (vwidth(s) <= width) return s;
+  let out = "";
+  let w = 0;
+  let i = 0;
+  const SGR_RE = /\x1b\[[0-9;]*m/g;
+  while (i < s.length) {
+    SGR_RE.lastIndex = i;
+    const m = SGR_RE.exec(s);
+    if (m && m.index === i) {
+      out += m[0];
+      i = SGR_RE.lastIndex;
+      continue;
+    }
+    const cp = s.codePointAt(i) ?? 0;
+    const ch = String.fromCodePoint(cp);
+    const cw = isWide(cp) ? 2 : 1;
+    if (w + cw > width - 1) break; // 留 1 列给 …
+    out += ch;
+    w += cw;
+    i += ch.length;
+  }
+  return out + "…\x1b[0m";
+}
+
 /** 右侧补空格到指定可见宽度。 */
 function padEnd(s: string, width: number): string {
   return s + " ".repeat(Math.max(0, width - vwidth(s)));

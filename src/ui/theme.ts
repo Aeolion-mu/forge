@@ -33,6 +33,8 @@ export const ansi = {
   tool: wrap(208),
   error: wrap(202),
   amber: wrap(214),
+  white: wrap(231), // theme.prompt #ffffff 的 256 色等价（菜单/选择器选中项）
+  confirm: wrap(220), // theme.confirm #ffd700 的 256 色等价（权限确认引导词）
   add: wrap(220), // diff 新增行：金（暖色内，与删除的橙红区分）
   del: wrap(202), // diff 删除行：橙红
   // 次要/状态文本：用浅灰色号(250)而非 ANSI dim 属性——dim 在多数终端被压得过暗。
@@ -41,6 +43,13 @@ export const ansi = {
   // 用户消息块的浅灰背景（256 色阶 237）：整行铺满，与正文/工具输出一眼区分。
   userBg: (s: string) => `\x1b[48;5;237m${s}\x1b[0m`,
 };
+
+// 应用内选区（拖选/双击/三击）的配色：蓝底 + 亮白前景——原生终端选择的语义，
+// 选区内原有颜色让位（统一可读）。取 Claude Code 实测色 #224466（RGB 34,68,102——
+// 在其底色 #222529 上叠蓝调；未选中区域不刷底、跟随终端自身背景）。
+// OFF 用 0m 全复位，调用方（highlightRange）负责在其后重放区间前的样式。
+export const SEL_ON = "\x1b[48;2;34;68;102m\x1b[97m";
+export const SEL_OFF = "\x1b[0m";
 
 // 思考/推理动态图标「火花闪烁」：实时 Reasoning 表头按帧闪动，折叠历史行用静止字形。
 export const SPARK_FRAMES = ["⋆", "✦", "✧", "✵", "✷", "✸", "✷", "✵", "✧", "✦"];

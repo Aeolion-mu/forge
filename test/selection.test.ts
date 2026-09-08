@@ -10,6 +10,7 @@ import {
   wholeLine,
   selectedText,
 } from "../src/ui/selection.js";
+import { SEL_ON, SEL_OFF } from "../src/ui/theme.js";
 
 const ESC = "\x1b";
 
@@ -41,12 +42,28 @@ test("plainSlice：按可见列切纯文本（ANSI 跳过、CJK 占 2 列、半�
   assert.equal(plainOf(line), "hello 世界abc");
 });
 
-test("highlightRange：区间内选择性反显，不撕裂 ANSI、宽字符整字处理", () => {
+test("highlightRange：区间套蓝底——前缀样式保留、区间内 SGR 剥离、出界重放、宽字符整字", () => {
   const line = `${ESC}[31mab中c${ESC}[0m`;
   // 可见列: a0 b1 中2-3 c4
   const h = highlightRange(line, 1, 4); // 选中 b中
-  assert.ok(h.includes(`\x1b[31ma${ESC}[7mb中${ESC}[27mc`), h);
-  assert.ok(h.endsWith(`${ESC}[27m${ESC}[0m`) || h.endsWith(`c${ESC}[0m`), h);
+  // 区间前样式原样（a 仍红）；区间起 SEL_ON（蓝底亮白）
+  assert.ok(h.includes(`${ESC}[31ma${SEL_ON}b中`), h);
+  // 出界：SEL_OFF 后重放区间前样式（c 仍红）
+  assert.ok(h.includes(`${SEL_OFF}${ESC}[31mc`), h);
+  assert.ok(h.endsWith(`c${ESC}[0m`), h);
+});
+
+test("highlightRange：区间内的 SGR 丢弃（diff 色带/语法色在选区内让位）", () => {
+  const line = `x${ESC}[38;5;202my${ESC}[0mz`;
+  const h = highlightRange(line, 0, 3); // 全选
+  assert.equal(h, `${SEL_ON}xyz${SEL_OFF}`); // 无任何转义残留
+});
+
+test("highlightRange：选到行尾在区间内收尾 SEL_OFF+重放（0m 后无样式则空）", () => {
+  const line = `${ESC}[31mabc${ESC}[0mde`; // 可见列: a0 b1 c2 d3 e4
+  const h = highlightRange(line, 3, 99); // 选中 de（0m 后的裸文本）
+  // 0m 在区间外原样保留；区间内无样式可剥；行尾 SEL_OFF + 重放（累计样式为空）
+  assert.equal(h, `${ESC}[31mabc${ESC}[0m${SEL_ON}de${SEL_OFF}`);
 });
 
 test("expandWord：路径整选、标点分段、中文逐字、下划线连字", () => {

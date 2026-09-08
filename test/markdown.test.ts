@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { wrapVisible } from "../src/ui/markdown.js";
+import { wrapVisible, truncateVisible } from "../src/ui/markdown.js";
 
 /** 剔除 ANSI 后的可见宽度（CJK=2）。 */
 function vwidth(s: string): number {
@@ -41,6 +41,20 @@ test("CJK 按宽度折行（每字宽 2）", () => {
   const lines = out.split("\n");
   assert.ok(lines.length > 1);
   for (const ln of lines) assert.ok(vwidth(ln) <= 12, `行宽应≤12，实际 ${vwidth(ln)}`);
+});
+
+test("truncateVisible：不超宽原样返回；超宽截断以 … 收尾且不撕裂 ANSI", () => {
+  assert.equal(truncateVisible("short", 20), "short");
+  const t = truncateVisible("hello world", 8);
+  assert.equal(vwidth(t), 8, "截断后应恰好占满宽度");
+  assert.ok(t.startsWith("hello w…"), t);
+  // ANSI 感知：转义占 0 列原样保留，只截可见字符
+  const a = truncateVisible(`\x1b[38;5;250m  /resume 恢复会话——很长的描述\x1b[0m`, 14);
+  assert.ok(a.includes("\x1b[38;5;250m"), "前缀转义保留");
+  assert.ok(vwidth(a) <= 14, `截断后宽度≤14，实际 ${vwidth(a)}`);
+  assert.ok(a.endsWith(`…\x1b[0m`), a);
+  // 宽字符整字截断：宽度 7 = 三字(6) + …(1)，第四字不截半
+  assert.equal(truncateVisible("一二三四五六七八九", 7), "一二三…\x1b[0m");
 });
 
 test("保留并跨行续接 ANSI 颜色", () => {
