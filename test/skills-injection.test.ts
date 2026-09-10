@@ -98,7 +98,7 @@ test("P1：仓库 skills/ 全量注册——system prompt 只有一行摘要，c
     await agent.dispose();
     assert.equal(calls.length, 1);
     // rev3：摘要行常驻（总量 + 分区计数），清单不常驻；注册表全量（含 7 家 delta，vendor 随本机 fetch 状态）
-    assert.match(calls[0]!.systemPrompt, /【Skills】本机共 \d+ 个算子开发 skills（.*common 3/);
+    assert.match(calls[0]!.systemPrompt, /【Skills】本机共 \d+ 个算子开发 skills（.*common 4/);
     assert.ok(!calls[0]!.systemPrompt.includes("- triton-kernel-basics —"));
     for (const v of ["amd", "ascend", "enflame", "hygon", "iluvatar", "metax", "nvidia"]) {
       assert.ok(agent.skillsRegistry.records.some((r) => r.origin === `delta:${v}`), `delta:${v} 应已注册`);

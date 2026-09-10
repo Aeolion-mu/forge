@@ -104,7 +104,14 @@ export function makeSkillTools(registry: SkillsRegistry, workdir: string): Agent
       }
       readSet.add(rec.name);
       registry.noteUsed(rec.name); // 压缩摘要第 10 段 Skills used 的数据源（成功加载才记）
-      const header = `[skill: ${rec.name}]（${rec.origin}） 源文件 ${rec.filePath}\n\n`;
+      const header =
+        `[skill: ${rec.name}]（${rec.origin}） 源文件 ${rec.filePath}\n` +
+        (rec.upstream
+          ? `上游快照 ${rec.upstream.repo}@${rec.upstream.ref}` +
+            (rec.upstream.commit ? `（commit ${rec.upstream.commit.slice(0, 10)}）` : "") +
+            `——vendor 层勿手改（skills:fetch 会整目录覆盖），更新/定制走 skill-maintenance 指引\n`
+          : "") +
+        `\n`;
       let out = header + text.trim();
       if (resources.length) {
         out += `\n\n〔资源〕${resources.join(" · ")}（相对 skill 目录 ${rec.dir}；项目内可 read_file，全局/内置路径如被读边界拦截则只作参考）`;

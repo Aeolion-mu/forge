@@ -143,3 +143,30 @@ test("P4：成功加载记入 registry.usedList（幂等去重；失败不记）
   await call(list, {}); // skill_list 不算「已读」
   assert.deepEqual(registry.usedList(), ["long-doc"]);
 });
+
+test("vendor skill：header 带上游溯源行（repo@ref + 短 commit + 勿手改指引）；非 vendor 层无此行", async () => {
+  // 独立 fixture：builtin vendor 层带 .vendor-meta.json
+  const wf = (rel: string, content: string): void => {
+    const p = join(root, rel);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, content, "utf8");
+  };
+  wf("vb/common/own/SKILL.md", "---\nname: own\ndescription: 自建\n---\n正文");
+  wf("vb/vendors/geak/g1/SKILL.md", "---\nname: g1\ndescription: vendor 样本\n---\n正文");
+  wf("vb/vendors/geak/.vendor-meta.json", JSON.stringify({
+    repo: "https://github.com/AMD-AGI/GEAK", ref: "main",
+    commit: "e867fa4ae4516f644221cb04dcdf24008a43cb99", license: "MIT",
+  }));
+  const reg2 = SkillsRegistry.create({ builtinRoot: join(root, "vb"), builtin: true, globalDir: join(root, "ng2"), projectDir: join(root, "np2") });
+  const read2 = makeSkillTools(reg2, join(root, "vb")).find((t) => t.name === "skill_read")!;
+
+  const vendor = await call(read2 as typeof read, { name: "g1" });
+  assert.match(vendor.text, /上游快照 https:\/\/github\.com\/AMD-AGI\/GEAK@main/);
+  assert.match(vendor.text, /commit e867fa4ae4/);
+  assert.match(vendor.text, /skills:fetch 会整目录覆盖/);
+  assert.match(vendor.text, /skill-maintenance/);
+  assert.equal(vendor.details.ok, true);
+
+  const own = await call(read2 as typeof read, { name: "own" });
+  assert.ok(!own.text.includes("上游快照"), "非 vendor 层不应有溯源行");
+});

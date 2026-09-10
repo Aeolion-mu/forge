@@ -45,6 +45,11 @@ export interface SkillRecord {
   invocation: { model: boolean; user: boolean };
   /** 索引渲染降级为「只列名」（overrides 四态之 name-only）。 */
   nameOnly?: boolean;
+  /**
+   * vendor 层溯源（.vendor-meta.json，skills:fetch 落盘）：该 vendor 全体记录共享。
+   * skill_read 头部展示给模型——用户令「更新某个 skill」时它知道上游在哪、怎么刷。
+   */
+  upstream?: { repo: string; ref: string; commit?: string };
   /** 标准可选字段 + 两家扩展字段原样保留（license/compatibility/metadata/allowed-tools/...）。 */
   meta: Record<string, unknown>;
 }
@@ -121,6 +126,8 @@ export interface ScanOptions {
   origin: string;
   /** legacy prompts 目录：无 frontmatter 的裸 .md 也收为 codex-prompt-legacy。 */
   legacy?: boolean;
+  /** vendor 层上游溯源（.vendor-meta.json，该根下全体记录共享；其余层不填）。 */
+  upstream?: { repo: string; ref: string; commit?: string };
 }
 
 export interface ScanResult {
@@ -293,6 +300,7 @@ function finalizeRecord(args: {
       model: !(fm["disable-model-invocation"] === true || codexImplicit === false),
       user: !(fm["user-invocable"] === false),
     },
+    ...(opts.upstream ? { upstream: opts.upstream } : {}),
     meta: fm,
   };
 }
@@ -348,6 +356,22 @@ export function extractSection(body: string, section: string): string | null {
 // 注册表：create() 一次成型、全量注册
 // ---------------------------------------------------------------------------
 
+/**
+ * 读 vendor 快照根的 .vendor-meta.json（skills:fetch 落盘：repo/ref/commit/license）。
+ * 缺失或坏格式 → undefined（静默：没跑过 fetch 的目录不算错，不该吓用户）。
+ */
+function readVendorMeta(vendorDir: string): { repo: string; ref: string; commit?: string } | undefined {
+  const p = join(vendorDir, ".vendor-meta.json");
+  if (!existsSync(p)) return undefined;
+  try {
+    const m = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+    if (typeof m.repo !== "string" || typeof m.ref !== "string" || !m.repo || !m.ref) return undefined;
+    return { repo: m.repo, ref: m.ref, ...(typeof m.commit === "string" && m.commit ? { commit: m.commit } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
 export interface SkillsRegistryOptions {
   /** forge 仓库 skills/ 根（common + delta/* + vendors/*）；不传或不存在 → 无内置。 */
   builtinRoot?: string;
@@ -394,7 +418,11 @@ export class SkillsRegistry {
         for (const e of readdirSync(vendorsRoot, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
           if (!e.isDirectory() || e.name.startsWith(".")) continue;
           if (e.name.endsWith(".json")) continue; // skills.lock.json
-          builtinLayers.push({ dir: join(vendorsRoot, e.name), so: { source: "builtin", layer: "vendor", origin: `vendor:${e.name}` } });
+          const upstream = readVendorMeta(join(vendorsRoot, e.name));
+          builtinLayers.push({
+            dir: join(vendorsRoot, e.name),
+            so: { source: "builtin", layer: "vendor", origin: `vendor:${e.name}`, ...(upstream ? { upstream } : {}) },
+          });
         }
       }
       const deltaRoot = join(opts.builtinRoot, "delta");

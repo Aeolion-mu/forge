@@ -239,18 +239,19 @@ function repoSkillsWithoutVendors(): string {
   return dest;
 }
 
-test("仓库 skills/ 全量注册：common 3 个 + 7 家 delta（无 vendors 也能完整工作）", () => {
+test("仓库 skills/ 全量注册：common 4 个（含 skill-maintenance）+ 7 家 delta（无 vendors 也能完整工作）", () => {
   const reg = SkillsRegistry.create({
     builtinRoot: repoSkillsWithoutVendors(), builtin: true,
     globalDir: join(root, "no-global"), projectDir: join(root, "no-proj"),
   });
   const count = (origin: string): number => reg.records.filter((r) => r.origin === origin).length;
-  assert.equal(count("common"), 3);
+  assert.equal(count("common"), 4);
+  assert.ok(reg.get("skill-maintenance"), "维护指引 skill 应在 common 层");
   for (const v of ["amd", "ascend", "enflame", "hygon", "iluvatar", "metax", "nvidia"]) {
     assert.equal(count(`delta:${v}`), 1, `delta:${v} 应有 1 个记录`);
   }
   assert.match(reg.summaryLine, /本机共 \d+ 个算子开发 skills/);
-  assert.match(reg.summaryLine, /common 3/);
+  assert.match(reg.summaryLine, /common 4/);
 });
 
 test("仓库 vendors 已 fetch 时全量并入（本机实拉后自然生效，无 manifest 引导）", () => {
@@ -260,6 +261,26 @@ test("仓库 vendors 已 fetch 时全量并入（本机实拉后自然生效，�
   writeFileSync(join(b, "vendors/my-vendor/some-skill/SKILL.md"), skill("some-skill", "vendor 快照样本"), "utf8");
   const reg = SkillsRegistry.create({ builtinRoot: b, builtin: true, globalDir: join(root, "ng"), projectDir: join(root, "np") });
   assert.equal(reg.get("some-skill")!.origin, "vendor:my-vendor");
+});
+
+test("vendor 溯源：.vendor-meta.json → 该 vendor 全体记录挂 upstream；无 meta 静默 undefined（非 vendor 层不受影响）", () => {
+  wf("b/common/own/SKILL.md", skill("own", "自建样本"));
+  wf("b/vendors/geak/g1/SKILL.md", skill("g1", "样本一"));
+  wf("b/vendors/geak/g2/SKILL.md", skill("g2", "样本二"));
+  wf("b/vendors/geak/.vendor-meta.json", JSON.stringify({
+    repo: "https://github.com/AMD-AGI/GEAK", ref: "main",
+    commit: "e867fa4ae4516f644221cb04dcdf24008a43cb99", license: "MIT",
+  }));
+  wf("b/vendors/bare/b1/SKILL.md", skill("b1", "没跑过 fetch 的 vendor"));
+  wf("b/vendors/broken/.vendor-meta.json", "{不是 json");
+  const reg = SkillsRegistry.create({ builtinRoot: join(root, "b"), builtin: true, globalDir: join(root, "ng"), projectDir: join(root, "np") });
+  for (const n of ["g1", "g2"]) {
+    assert.equal(reg.get(n)!.upstream?.repo, "https://github.com/AMD-AGI/GEAK", `${n} 应带 repo`);
+    assert.equal(reg.get(n)!.upstream?.ref, "main");
+    assert.equal(reg.get(n)!.upstream?.commit?.slice(0, 10), "e867fa4ae4", "commit 短 sha");
+  }
+  assert.equal(reg.get("own")!.upstream, undefined, "common 层无 upstream");
+  assert.equal(reg.get("b1")!.upstream, undefined, "无 meta 的 vendor 静默");
 });
 
 // ---------------------------------------------------------------------------
