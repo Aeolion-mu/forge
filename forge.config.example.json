@@ -1,0 +1,21 @@
+{
+  "$comment": "Copy to forge.config.json (gitignored). Model registry only — NO secrets. Put API keys in .env. maxContextTokens is a virtual window used for compaction stress-tests (~900K, close to DeepSeek's ~1M); delete the line to use the model's full window.",
+  "defaultModel": "deepseek/deepseek-v4-pro",
+  "maxContextTokens": 900000,
+  "models": [
+    { "ref": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro (default)" },
+    { "ref": "deepseek/deepseek-v4-flash", "label": "DeepSeek V4 Flash (fast / cheap)" },
+    { "ref": "anthropic/claude-haiku-4-5", "label": "Claude Haiku 4.5" },
+    { "ref": "anthropic/claude-sonnet-4-6", "label": "Claude Sonnet 4.6" },
+    { "ref": "openai/gpt-5.1", "label": "OpenAI GPT-5.1" }
+  ],
+  "ssh": {
+    "$comment": "Optional — only needed if you use the built-in ssh tool. Leave password empty to use key-based auth from your ssh-agent.",
+    "target": {
+      "host": "your.server.example.com",
+      "user": "root",
+      "port": 22,
+      "password": ""
+    }
+  }
+}
